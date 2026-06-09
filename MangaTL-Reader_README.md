@@ -27,8 +27,6 @@ Fast forward to 2026. AI has genuinely gotten better. People who know nothing ab
 
 So, with nothing but my laptop, five dollars, basic Python knowledge, and a lot of prompting, I built this. It may not match paid translators, but I hope it helps you read something you couldn't before.
 
-— *a 19-year-old Pre-University student*
-
 ---
 
 # MangaTL-Reader — User Manual
