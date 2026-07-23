@@ -1,0 +1,5628 @@
+#!/usr/bin/env python3
+"""
+MangaTL-Reader  —  Single-file manga translation tool
+======================================================
+
+Translates any MangaDex chapter that has a non-English translation
+(Vietnamese, Korean, Indonesian, etc.) into English or your chosen language
+using OCR (EasyOCR / Gemini Vision) + AI translation (Gemini / DeepSeek).
+
+USAGE
+  python MangaTL-Reader.py        — starts the server and opens the browser
+  (Windows) double-click the file — same, if Python is installed
+
+FIRST RUN
+  Packages install automatically (Flask, EasyOCR, OpenCV …).
+  EasyOCR downloads a ~100–400 MB language model — this takes 2-5 minutes.
+  The browser opens as soon as the server is ready.
+
+REQUIREMENTS
+  Python 3.9+  ·  Internet connection  ·  A Gemini or DeepSeek API key
+
+API KEYS (free options)
+  Gemini  → https://aistudio.google.com/app/apikey  (free tier, no credit card)
+  DeepSeek → https://platform.deepseek.com           (~$0.02–0.05 / chapter)
+"""
+
+# ─── Auto-install missing dependencies ───────────────────────────────────────
+# Runs before every other import so we can guarantee packages exist.
+# On first run this takes a few minutes; subsequent runs skip instantly.
+
+import sys
+import subprocess
+import importlib.util
+
+_REQUIRED = {
+    "flask":                  "flask",
+    "requests":               "requests",
+    "easyocr":                "easyocr",
+    "pillow":                 "PIL",
+    "numpy":                  "numpy",
+    "opencv-python-headless": "cv2",
+}
+
+def _bootstrap():
+    missing = [pkg for pkg, mod in _REQUIRED.items()
+               if importlib.util.find_spec(mod) is None]
+    if not missing:
+        return
+
+    print()
+    print("  ╔══════════════════════════════════════════════╗")
+    print("  ║      MangaTL — First-Time Setup              ║")
+    print("  ╚══════════════════════════════════════════════╝")
+    print()
+    print(f"  Installing {len(missing)} missing package(s):")
+    for p in missing:
+        print(f"    •  {p}")
+    print()
+    print("  EasyOCR includes a language model (~100–400 MB).")
+    print("  This may take 2–5 minutes. Please wait.")
+    print("  The browser will open automatically when ready.")
+    print()
+
+    # --break-system-packages is needed on modern Debian/Ubuntu systems but is
+    # silently ignored on Windows and macOS — safe to pass unconditionally.
+    try:
+        subprocess.check_call(
+            [sys.executable, "-m", "pip", "install", "--quiet",
+             "--break-system-packages"] + missing
+        )
+        print("  ✓  Setup complete!\n")
+    except subprocess.CalledProcessError:
+        print()
+        print("  ✗  Auto-install failed.")
+        print("  Run this manually, then try again:")
+        print("     pip install " + " ".join(missing))
+        sys.exit(1)
+
+_bootstrap()
+
+# ─── All other imports (safe after bootstrap) ─────────────────────────────────
+
+import io
+import base64
+import socket
+import threading
+import time
+import webbrowser
+from pathlib import Path
+
+import cv2
+import numpy as np
+import requests
+from flask import Flask, Response, abort, jsonify, request
+from werkzeug.exceptions import HTTPException
+from PIL import Image
+
+HOST         = "127.0.0.1"
+PORT         = 8080
+# ─── Embedded frontend (generated — do not edit the HTML here directly) ─────
+_HTML = r"""
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
+<title>MangaTL Reader</title>
+<link href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=Share+Tech+Mono&family=Crimson+Pro:ital,wght@0,400;0,600;1,400&display=swap" rel="stylesheet">
+<style>
+:root {
+  --bg:       #0c0c10;
+  --bg2:      #111116;
+  --bg3:      #16161e;
+  --bg4:      #1c1c26;
+  --text:     #d4d0c8;
+  --dim:      #454050;
+  --mid:      #807888;
+  --border:   #222230;
+  --border2:  #2e2e40;
+  --ui:       #00e5b0;
+  --danger:   #ff3a3a;
+  --speech:   #a78bfa;
+  --thought:  #60a5fa;
+  --sfx:      #f87171;
+  --narr:     #fbbf24;
+  --sign:     #34d399;
+}
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+html { scroll-behavior: smooth; }
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: 'Crimson Pro', Georgia, serif;
+  font-size: 1.05rem;
+  line-height: 1.8;
+  min-height: 100dvh;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.screen { display: none; }
+.screen.active { display: flex; flex-direction: column; min-height: 100dvh; }
+
+/* ─── HOME ───────────────────────────────────── */
+#screen-home {
+  align-items: center;
+  justify-content: center;
+  padding: 2.5rem 1.4rem;
+}
+.home-inner { width: 100%; max-width: 460px; }
+.home-brand { text-align: center; margin-bottom: 2.8rem; }
+.home-title {
+  font-family: 'Bebas Neue', sans-serif;
+  font-size: 3.2rem;
+  letter-spacing: 0.14em;
+  color: var(--dim);
+  line-height: 1;
+}
+.home-title span { color: var(--ui); }
+.home-sub {
+  font-family: 'Share Tech Mono', monospace;
+  font-size: 0.62rem;
+  letter-spacing: 0.22em;
+  color: var(--dim);
+  opacity: 0.7;
+  text-transform: uppercase;
+  margin-top: 0.35rem;
+}
+.form-group { margin-bottom: 1.1rem; }
+.merge-slider-row {
+  display: flex;
+  align-items: center;
+  gap: 0.7rem;
+  margin-bottom: 1.1rem;
+}
+.merge-slider-row input[type=range] {
+  flex: 1;
+  -webkit-appearance: none;
+  appearance: none;
+  height: 3px;
+  background: var(--border);
+  border-radius: 2px;
+  outline: none;
+  cursor: pointer;
+}
+.merge-slider-row input[type=range]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 13px; height: 13px;
+  border-radius: 50%;
+  background: var(--ui);
+  cursor: pointer;
+}
+.merge-slider-row input[type=range]::-moz-range-thumb {
+  width: 13px; height: 13px;
+  border-radius: 50%;
+  background: var(--ui);
+  border: none;
+  cursor: pointer;
+}
+.merge-slider-val {
+  font-family: 'Share Tech Mono', monospace;
+  font-size: 0.7rem;
+  color: var(--ui);
+  min-width: 2.8rem;
+  text-align: right;
+}
+.form-label {
+  display: block;
+  font-family: 'Share Tech Mono', monospace;
+  font-size: 0.62rem;
+  letter-spacing: 0.16em;
+  color: var(--dim);
+  text-transform: uppercase;
+  margin-bottom: 0.4rem;
+}
+.form-input {
+  width: 100%;
+  background: var(--bg3);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text);
+  font-family: 'Share Tech Mono', monospace;
+  font-size: 0.78rem;
+  padding: 0.75rem 0.95rem;
+  outline: none;
+  transition: border-color 0.15s;
+}
+.form-input:focus { border-color: var(--border2); }
+.form-input::placeholder { color: var(--dim); opacity: 0.6; }
+.form-row { display: flex; gap: 0.8rem; }
+.form-row .form-group { flex: 1; margin-bottom: 0; }
+.form-row-wrap { margin-bottom: 1.1rem; }
+.btn-go {
+  width: 100%;
+  background: transparent;
+  border: 1px solid var(--ui);
+  color: var(--ui);
+  font-family: 'Bebas Neue', sans-serif;
+  font-size: 1.2rem;
+  letter-spacing: 0.25em;
+  padding: 0.9rem;
+  border-radius: 4px;
+  cursor: pointer;
+  margin-top: 0.6rem;
+  transition: background 0.15s, color 0.15s;
+}
+.btn-go:hover   { background: rgba(0,229,176,0.07); }
+.btn-go:active  { background: var(--ui); color: #000; }
+.btn-go:disabled { border-color: var(--dim); color: var(--dim); cursor: not-allowed; }
+.home-hint {
+  font-family: 'Share Tech Mono', monospace;
+  font-size: 0.6rem;
+  letter-spacing: 0.08em;
+  color: var(--dim);
+  opacity: 0.6;
+  text-align: center;
+  margin-top: 1.2rem;
+  line-height: 2;
+}
+.home-hint a { color: inherit; text-decoration: underline; cursor: pointer; }
+
+/* MangaDex login accordion */
+.md-login-wrap {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  margin-bottom: 1.1rem;
+  overflow: hidden;
+}
+.md-login-toggle {
+  width: 100%; background: none; border: none; cursor: pointer;
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 0.6rem 0.85rem;
+  color: var(--mid); font-family: inherit; font-size: 0.78rem; letter-spacing: 0.04em;
+  transition: color 0.15s;
+}
+.md-login-toggle:hover { color: var(--text); }
+.md-login-toggle .md-status {
+  display: flex; align-items: center; gap: 0.4rem; font-size: 0.75rem;
+}
+.md-status-dot {
+  width: 7px; height: 7px; border-radius: 50%;
+  background: var(--dim); flex-shrink: 0; transition: background 0.2s;
+}
+.md-status-dot.online { background: var(--ui); }
+.md-login-toggle .arrow { font-size: 0.65rem; transition: transform 0.2s; }
+.md-login-wrap.open .arrow { transform: rotate(90deg); }
+.md-login-body {
+  display: none; padding: 0.75rem 0.85rem 0.85rem;
+  border-top: 1px solid var(--border);
+  background: var(--bg2);
+}
+.md-login-wrap.open .md-login-body { display: block; }
+.md-login-body .form-group { margin-bottom: 0.75rem; }
+.md-login-body .form-group:last-of-type { margin-bottom: 0.85rem; }
+.md-login-hint {
+  font-size: 0.72rem; color: var(--dim); margin-bottom: 0.85rem; line-height: 1.5;
+}
+.md-login-hint a { color: var(--mid); text-decoration: underline; }
+.btn-md-login {
+  width: 100%; padding: 0.55rem; border-radius: 5px;
+  border: 1px solid var(--border2); background: none;
+  color: var(--text); font-family: inherit; font-size: 0.82rem;
+  cursor: pointer; transition: border-color 0.15s, color 0.15s;
+}
+.btn-md-login:hover    { border-color: var(--ui); color: var(--ui); }
+.btn-md-login:disabled { opacity: 0.45; cursor: not-allowed; }
+
+/* ─── READER ─────────────────────────────────── */
+#screen-reader { padding: 0; background: var(--bg); }
+.reader-header {
+  position: sticky;
+  top: 0;
+  z-index: 100;
+  background: var(--bg2);
+  border-bottom: 1px solid var(--border);
+  padding: 0.75rem 1.2rem 0.6rem;
+}
+.reader-header-top {
+  display: flex;
+  align-items: center;
+  gap: 0.9rem;
+  margin-bottom: 0.45rem;
+}
+.btn-back {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--dim);
+  font-family: 'Share Tech Mono', monospace;
+  font-size: 0.62rem;
+  padding: 0.4rem 0.7rem;
+  border-radius: 3px;
+  cursor: pointer;
+  letter-spacing: 0.1em;
+  white-space: nowrap;
+  flex-shrink: 0;
+  transition: border-color 0.15s, color 0.15s;
+}
+.btn-back:active { border-color: var(--mid); color: var(--mid); }
+.reader-titles  { flex: 1; min-width: 0; }
+.reader-manga-title {
+  font-family: 'Share Tech Mono', monospace;
+  font-size: 0.78rem;
+  letter-spacing: 0.05em;
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.reader-ch-info {
+  font-family: 'Share Tech Mono', monospace;
+  font-size: 0.6rem;
+  color: var(--dim);
+  margin-top: 0.05rem;
+  letter-spacing: 0.05em;
+}
+.reader-credit {
+  font-family: 'Share Tech Mono', monospace;
+  font-size: 0.58rem;
+  color: var(--dim);
+  margin-top: 0.18rem;
+  letter-spacing: 0.04em;
+  opacity: 0.7;
+}
+.reader-credit a {
+  color: var(--mid);
+  text-decoration: none;
+  border-bottom: 1px solid var(--border2);
+  transition: color 0.15s, border-color 0.15s;
+}
+.reader-credit a:hover { color: var(--ui); border-color: var(--ui); }
+.reader-header-bottom {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.6rem;
+  margin-bottom: 0.38rem;
+}
+.reader-status {
+  font-family: 'Share Tech Mono', monospace;
+  font-size: 0.62rem;
+  color: var(--mid);
+  letter-spacing: 0.08em;
+  flex: 1;
+}
+.cache-pill {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  background: var(--bg3);
+  border: 1px solid var(--border);
+  border-radius: 20px;
+  padding: 0.18rem 0.55rem 0.18rem 0.45rem;
+  flex-shrink: 0;
+  white-space: nowrap;
+}
+.cache-pill-icon {
+  font-size: 0.6rem;
+  opacity: 0.6;
+}
+.cache-pill-label {
+  font-family: 'Share Tech Mono', monospace;
+  font-size: 0.56rem;
+  color: var(--dim);
+  letter-spacing: 0.08em;
+}
+.cache-pill-label span {
+  color: var(--ui);
+  font-weight: bold;
+}
+.btn-cache-clear {
+  background: transparent;
+  border: none;
+  color: var(--dim);
+  font-family: 'Share Tech Mono', monospace;
+  font-size: 0.55rem;
+  letter-spacing: 0.06em;
+  cursor: pointer;
+  padding: 0 0.1rem;
+  border-left: 1px solid var(--border);
+  margin-left: 0.3rem;
+  padding-left: 0.4rem;
+  transition: color 0.15s;
+  line-height: 1;
+}
+.btn-cache-clear:hover { color: var(--danger); }
+
+/* ─── HOME CACHE STRIP ───────────────────────── */
+.home-cache-strip {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  background: var(--bg3);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.55rem 0.85rem;
+  margin-bottom: 1.1rem;
+  gap: 0.8rem;
+}
+.home-cache-info {
+  font-family: 'Share Tech Mono', monospace;
+  font-size: 0.62rem;
+  color: var(--dim);
+  letter-spacing: 0.06em;
+  line-height: 1.7;
+}
+.home-cache-info strong {
+  color: var(--ui);
+  font-weight: normal;
+}
+.home-cache-info .cache-empty {
+  color: var(--dim);
+  opacity: 0.5;
+}
+.btn-clear-cache-home {
+  background: transparent;
+  border: 1px solid var(--border2);
+  color: var(--dim);
+  font-family: 'Share Tech Mono', monospace;
+  font-size: 0.58rem;
+  letter-spacing: 0.1em;
+  padding: 0.35rem 0.7rem;
+  border-radius: 3px;
+  cursor: pointer;
+  white-space: nowrap;
+  flex-shrink: 0;
+  transition: border-color 0.15s, color 0.15s;
+}
+.btn-clear-cache-home:hover    { border-color: var(--danger); color: var(--danger); }
+.btn-clear-cache-home:disabled { opacity: 0.3; cursor: not-allowed; }
+.progress-track {
+  height: 2px;
+  background: var(--border);
+  border-radius: 2px;
+  overflow: hidden;
+}
+.progress-fill {
+  height: 100%;
+  background: var(--ui);
+  border-radius: 2px;
+  width: 0%;
+  transition: width 0.35s ease;
+}
+
+/* ─── PAGES ──────────────────────────────────── */
+#pages-container { flex: 1; padding: 1.2rem 1rem 4rem; }
+.page-card {
+  max-width: 700px;
+  margin: 0 auto 2.8rem;
+  animation: fadeUp 0.3s ease both;
+}
+@keyframes fadeUp {
+  from { opacity: 0; transform: translateY(10px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.img-wrap { position: relative; width: 100%; line-height: 0; min-height: 150px; }
+.page-img {
+  width: 100%;
+  height: auto;
+  display: block;
+  border-radius: 3px 3px 0 0;
+  border: 1px solid var(--border);
+  border-bottom: none;
+}
+.page-img-only {
+  width: 100%;
+  height: auto;
+  display: block;
+  border-radius: 3px;
+  border: 1px solid var(--border);
+}
+.pg-label {
+  position: absolute;
+  bottom: 8px;
+  right: 8px;
+  font-family: 'Share Tech Mono', monospace;
+  font-size: 0.6rem;
+  letter-spacing: 0.1em;
+  color: rgba(255,255,255,0.6);
+  background: rgba(0,0,0,0.6);
+  padding: 0.2rem 0.45rem;
+  border-radius: 2px;
+  pointer-events: none;
+}
+.badge {
+  position: absolute;
+  transform: translate(-50%, -50%);
+  width: 18px; height: 18px;
+  border-radius: 50%;
+  display: flex; align-items: center; justify-content: center;
+  font-family: 'Share Tech Mono', monospace;
+  font-size: 0.55rem;
+  font-weight: bold;
+  pointer-events: none;
+  border: 1.5px solid rgba(0,0,0,0.4);
+  line-height: 1;
+  z-index: 5;
+}
+.badge.t-speech    { background: var(--speech); color: #000; }
+.badge.t-thought   { background: var(--thought); color: #000; }
+.badge.t-sfx       { background: var(--sfx); color: #000; }
+.badge.t-narration { background: var(--narr); color: #000; }
+.badge.t-sign      { background: var(--sign); color: #000; }
+
+.trans-panel {
+  background: var(--bg2);
+  border: 1px solid var(--border);
+  border-top: none;
+  border-radius: 0 0 4px 4px;
+}
+.t-row {
+  display: flex;
+  align-items: baseline;
+  gap: 0.6rem;
+  padding: 0.45rem 0.85rem;
+  border-bottom: 1px solid var(--border);
+  line-height: 1.55;
+}
+.t-row:last-child { border-bottom: none; }
+.t-num {
+  font-family: 'Share Tech Mono', monospace;
+  font-size: 0.62rem;
+  color: var(--dim);
+  min-width: 1.1rem;
+  text-align: right;
+  flex-shrink: 0;
+}
+.t-tag {
+  font-family: 'Share Tech Mono', monospace;
+  font-size: 0.6rem;
+  letter-spacing: 0.06em;
+  padding: 0.1rem 0.32rem;
+  border-radius: 2px;
+  flex-shrink: 0;
+  text-transform: uppercase;
+  border: 1px solid;
+  opacity: 0.7;
+}
+.t-tag.speech    { color: var(--speech); border-color: var(--speech); }
+.t-tag.thought   { color: var(--thought); border-color: var(--thought); }
+.t-tag.sfx       { color: var(--sfx); border-color: var(--sfx); }
+.t-tag.narration { color: var(--narr); border-color: var(--narr); }
+.t-tag.sign      { color: var(--sign); border-color: var(--sign); }
+.t-text {
+  font-family: 'Crimson Pro', serif;
+  font-size: 0.97rem;
+  color: var(--text);
+  line-height: 1.5;
+}
+.no-text-note {
+  background: var(--bg2);
+  border: 1px solid var(--border);
+  border-top: none;
+  border-radius: 0 0 4px 4px;
+  padding: 0.6rem 0.85rem;
+  font-family: 'Share Tech Mono', monospace;
+  font-size: 0.62rem;
+  color: var(--dim);
+  letter-spacing: 0.1em;
+  text-align: center;
+  opacity: 0.6;
+}
+
+/* ─── READING ORDER TOGGLE ───────────────────── */
+.read-order-row {
+  display: flex;
+  align-items: center;
+  gap: 0;
+  background: var(--bg3);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  overflow: hidden;
+  margin-bottom: 1.1rem;
+}
+.read-order-btn {
+  flex: 1;
+  background: transparent;
+  border: none;
+  border-right: 1px solid var(--border);
+  color: var(--dim);
+  font-family: 'Share Tech Mono', monospace;
+  font-size: 0.6rem;
+  letter-spacing: 0.1em;
+  padding: 0.6rem 0.3rem;
+  cursor: pointer;
+  transition: background 0.14s, color 0.14s;
+  text-align: center;
+  line-height: 1.5;
+}
+.read-order-btn:last-child { border-right: none; }
+.read-order-btn:hover { color: var(--text); background: rgba(255,255,255,0.04); }
+.read-order-btn.active { color: var(--ui); background: rgba(0,229,176,0.08); }
+.read-order-label {
+  display: block;
+  font-family: 'Share Tech Mono', monospace;
+  font-size: 0.62rem;
+  letter-spacing: 0.16em;
+  color: var(--dim);
+  text-transform: uppercase;
+  margin-bottom: 0.4rem;
+}
+
+/* ─── INLINE REORDER PANEL ───────────────────── */
+.btn-reorder-page {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  background: rgba(0,0,0,0.65);
+  border: 1px solid var(--border2);
+  color: var(--dim);
+  font-family: 'Share Tech Mono', monospace;
+  font-size: 0.6rem;
+  letter-spacing: 0.1em;
+  padding: 0.22rem 0.5rem;
+  border-radius: 3px;
+  cursor: pointer;
+  z-index: 3;
+  transition: color 0.15s, border-color 0.15s;
+}
+.btn-reorder-page:hover  { color: var(--ui); border-color: var(--ui); }
+.btn-reorder-page.active { color: var(--ui); border-color: var(--ui); background: rgba(0,229,176,0.08); }
+
+.reorder-panel {
+  background: var(--bg2);
+  border: 1px solid var(--ui);
+  border-top: none;
+  border-radius: 0 0 4px 4px;
+  padding: 0.55rem 0.75rem 0.75rem;
+}
+.reorder-panel-hdr {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 0.5rem;
+}
+.reorder-panel-title {
+  font-family: 'Share Tech Mono', monospace;
+  font-size: 0.58rem;
+  letter-spacing: 0.14em;
+  color: var(--ui);
+  text-transform: uppercase;
+}
+.reorder-hint {
+  font-family: 'Share Tech Mono', monospace;
+  font-size: 0.55rem;
+  color: var(--dim);
+  opacity: 0.7;
+  letter-spacing: 0.06em;
+}
+.reorder-list { list-style: none; }
+.reorder-item {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.28rem 0;
+  border-bottom: 1px solid var(--border);
+  cursor: grab;
+  user-select: none;
+  transition: background 0.1s;
+  border-radius: 2px;
+}
+.reorder-item:last-child { border-bottom: none; }
+.reorder-item.dragging { opacity: 0.45; cursor: grabbing; }
+.reorder-item.drag-over { background: rgba(0,229,176,0.08); }
+.reorder-drag-handle {
+  color: var(--dim);
+  font-size: 0.75rem;
+  flex-shrink: 0;
+  opacity: 0.5;
+  cursor: grab;
+  padding: 0 0.15rem;
+}
+.reorder-badge-num {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px; height: 18px;
+  border-radius: 50%;
+  font-family: 'Share Tech Mono', monospace;
+  font-size: 0.52rem;
+  font-weight: bold;
+  border: 1.5px solid rgba(0,0,0,0.4);
+  flex-shrink: 0;
+  line-height: 1;
+}
+.reorder-badge-num.t-speech    { background: var(--speech); color: #000; }
+.reorder-badge-num.t-thought   { background: var(--thought); color: #000; }
+.reorder-badge-num.t-sfx       { background: var(--sfx); color: #000; }
+.reorder-badge-num.t-narration { background: var(--narr); color: #000; }
+.reorder-badge-num.t-sign      { background: var(--sign); color: #000; }
+.reorder-item-text {
+  flex: 1;
+  font-family: 'Share Tech Mono', monospace;
+  font-size: 0.6rem;
+  color: var(--mid);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+}
+.reorder-arrow-btns { display: flex; gap: 2px; flex-shrink: 0; }
+.reorder-arrow-btns button {
+  background: transparent;
+  border: 1px solid var(--border2);
+  color: var(--dim);
+  font-size: 0.65rem;
+  width: 22px; height: 22px;
+  border-radius: 3px;
+  cursor: pointer;
+  display: flex; align-items: center; justify-content: center;
+  transition: color 0.12s, border-color 0.12s;
+  line-height: 1;
+  padding: 0;
+}
+.reorder-arrow-btns button:hover { color: var(--ui); border-color: var(--ui); }
+.reorder-arrow-btns button:disabled { opacity: 0.25; cursor: not-allowed; }
+.btn-apply-order {
+  margin-top: 0.55rem;
+  width: 100%;
+  background: transparent;
+  border: 1px solid var(--ui);
+  color: var(--ui);
+  font-family: 'Share Tech Mono', monospace;
+  font-size: 0.62rem;
+  letter-spacing: 0.14em;
+  padding: 0.45rem;
+  border-radius: 3px;
+  cursor: pointer;
+  transition: background 0.14s;
+}
+.btn-apply-order:hover { background: rgba(0,229,176,0.08); }
+.page-err-note {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.8rem;
+  background: var(--bg2);
+  border: 1px solid rgba(255,58,58,0.3);
+  border-top: none;
+  border-radius: 0 0 4px 4px;
+  padding: 0.55rem 0.85rem;
+  font-family: 'Share Tech Mono', monospace;
+  font-size: 0.62rem;
+  color: var(--danger);
+  letter-spacing: 0.05em;
+}
+.btn-retry {
+  background: transparent;
+  border: 1px solid var(--danger);
+  color: var(--danger);
+  font-family: 'Share Tech Mono', monospace;
+  font-size: 0.62rem;
+  padding: 0.3rem 0.65rem;
+  border-radius: 3px;
+  cursor: pointer;
+  white-space: nowrap;
+  letter-spacing: 0.1em;
+  flex-shrink: 0;
+  transition: background 0.15s;
+}
+.btn-retry:hover    { background: rgba(255,58,58,0.1); }
+.btn-retry:disabled { opacity: 0.4; cursor: not-allowed; }
+
+/* Skeleton */
+.page-skeleton {
+  background: var(--bg2);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 1.4rem 1.2rem;
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+}
+.sk-num {
+  font-family: 'Bebas Neue', sans-serif;
+  font-size: 2rem;
+  color: var(--border2);
+  min-width: 2rem;
+  line-height: 1;
+}
+.sk-bar {
+  flex: 1;
+  height: 2px;
+  background: var(--border);
+  border-radius: 2px;
+  position: relative;
+  overflow: hidden;
+}
+.sk-bar::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(90deg, transparent, var(--border2), transparent);
+  animation: shimmer 1.6s infinite;
+}
+@keyframes shimmer {
+  from { transform: translateX(-100%); }
+  to   { transform: translateX(100%); }
+}
+
+/* ─── NAV BAR ─────────────────────────────────── */
+.nav-bar {
+  display: none;
+  position: sticky;
+  bottom: 0;
+  z-index: 100;
+  background: var(--bg2);
+  border-top: 1px solid var(--border);
+  padding: 0.7rem 1.2rem;
+  justify-content: space-between;
+  align-items: center;
+}
+.btn-nav {
+  background: transparent;
+  border: 1px solid var(--border2);
+  color: var(--mid);
+  font-family: 'Share Tech Mono', monospace;
+  font-size: 0.65rem;
+  padding: 0.5rem 1rem;
+  border-radius: 3px;
+  cursor: pointer;
+  letter-spacing: 0.12em;
+  transition: border-color 0.15s, color 0.15s;
+}
+.btn-nav:hover  { border-color: var(--ui); color: var(--ui); }
+.btn-nav:active { background: rgba(0,229,176,0.08); }
+
+/* ─── TOAST ───────────────────────────────────── */
+#toast {
+  display: none;
+  position: fixed;
+  bottom: 1.5rem;
+  left: 50%;
+  transform: translateX(-50%);
+  background: var(--bg4);
+  border: 1px solid var(--border2);
+  color: var(--text);
+  font-family: 'Share Tech Mono', monospace;
+  font-size: 0.68rem;
+  padding: 0.65rem 1.1rem;
+  border-radius: 4px;
+  z-index: 9999;
+  max-width: calc(100vw - 2.4rem);
+  text-align: center;
+  letter-spacing: 0.05em;
+  line-height: 1.6;
+}
+
+/* ─── CORRECTION UI ──────────────────────────── */
+.btn-correct {
+  position: absolute;
+  top: 8px; left: 8px;
+  background: rgba(0,0,0,0.65);
+  border: 1px solid var(--border2);
+  color: var(--dim);
+  font-family: 'Share Tech Mono', monospace;
+  font-size: 0.6rem;
+  letter-spacing: 0.1em;
+  padding: 0.22rem 0.5rem;
+  border-radius: 3px;
+  cursor: pointer;
+  z-index: 3;
+  transition: color 0.15s, border-color 0.15s;
+}
+.btn-correct:hover { color: var(--ui); border-color: var(--ui); }
+.btn-correct.active { color: var(--ui); border-color: var(--ui); background: rgba(0,229,176,0.08); }
+
+.page-card.correcting { max-width: min(95vw, 1300px); }
+
+.corr-layout {
+  display: flex;
+  align-items: flex-start;
+  border: 1px solid var(--border);
+  border-radius: 3px 3px 0 0;
+  overflow: hidden;
+}
+.corr-left {
+  flex: 0 0 55%;
+  display: flex;
+  flex-direction: column;
+  border-right: 1px solid var(--border);
+  min-width: 0;
+}
+.corr-toolbar {
+  display: flex;
+  background: var(--bg2);
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+.corr-tool {
+  flex: 1;
+  background: transparent;
+  border: none;
+  border-right: 1px solid var(--border);
+  color: var(--dim);
+  font-family: 'Share Tech Mono', monospace;
+  font-size: 0.56rem;
+  letter-spacing: 0.08em;
+  padding: 0.5rem 0.2rem;
+  cursor: pointer;
+  transition: color 0.12s, background 0.12s;
+}
+.corr-tool:last-child { border-right: none; }
+.corr-tool:hover { color: var(--text); }
+.corr-tool.active { color: var(--ui); background: rgba(0,229,176,0.06); }
+
+.corr-img-wrap {
+  position: relative;
+  width: 100%;
+  line-height: 0;
+}
+.corr-img { width: 100%; height: auto; display: block; user-select: none; }
+
+.corr-overlay {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+.corr-overlay.mode-select,
+.corr-overlay.mode-delete,
+.corr-overlay.mode-draw,
+.corr-overlay.mode-vision-draw { pointer-events: auto; cursor: crosshair; }
+
+.corr-rbox {
+  position: absolute;
+  border: 2px solid rgba(0,229,176,0.6);
+  background: rgba(0,229,176,0.07);
+  cursor: pointer;
+  box-sizing: border-box;
+  transition: background 0.1s;
+}
+.corr-rbox:hover { background: rgba(0,229,176,0.18); }
+.corr-rbox.selected { border-color: var(--ui); background: rgba(0,229,176,0.22); z-index: 2; }
+.corr-rbox.mode-delete { border-color: rgba(255,58,58,0.6); background: rgba(255,58,58,0.07); }
+.corr-rbox.mode-delete:hover { background: rgba(255,58,58,0.22); }
+.rbox-num {
+  position: absolute;
+  top: -1px; left: -1px;
+  background: var(--ui);
+  color: #000;
+  font-family: 'Share Tech Mono', monospace;
+  font-size: 0.5rem;
+  font-weight: bold;
+  padding: 0.05rem 0.28rem;
+  border-radius: 0 0 3px 0;
+  pointer-events: none;
+  line-height: 1.7;
+}
+.rbox-num.raw { background: #fbbf24; }
+/* Vision-draw replace-hint: flashing gold outline when a drawn box overlaps */
+.corr-rbox.vision-replace-target {
+  border-color: #f59e0b;
+  background: rgba(245,158,11,0.15);
+  animation: vrt-pulse 0.6s ease-in-out infinite alternate;
+}
+@keyframes vrt-pulse {
+  from { box-shadow: 0 0 0 1px rgba(245,158,11,0.3); }
+  to   { box-shadow: 0 0 0 4px rgba(245,158,11,0.5); }
+}
+
+.corr-raw-box {
+  position: absolute;
+  border: 1.5px dashed rgba(251,191,36,0.8);
+  background: rgba(251,191,36,0.05);
+  pointer-events: none;
+  box-sizing: border-box;
+}
+.draw-preview {
+  position: absolute;
+  border: 2px dashed var(--ui);
+  background: rgba(0,229,176,0.07);
+  pointer-events: none;
+  box-sizing: border-box;
+}
+.draw-preview.vision-mode {
+  border-color: #f59e0b;
+  background: rgba(245,158,11,0.07);
+}
+
+.corr-sidebar {
+  flex: 1;
+  background: var(--bg2);
+  padding: 0.85rem;
+  overflow-y: auto;
+  max-height: 80vh;
+  min-height: 220px;
+  min-width: 0;
+}
+.corr-empty-hint {
+  font-family: 'Share Tech Mono', monospace;
+  font-size: 0.6rem;
+  color: var(--dim);
+  opacity: 0.5;
+  text-align: center;
+  padding: 2.5rem 0;
+  line-height: 2.2;
+  letter-spacing: 0.05em;
+}
+.corr-sid-title {
+  font-family: 'Bebas Neue', sans-serif;
+  font-size: 0.9rem;
+  letter-spacing: 0.2em;
+  color: var(--ui);
+  margin-bottom: 0.65rem;
+}
+.corr-sid-label {
+  font-family: 'Share Tech Mono', monospace;
+  font-size: 0.56rem;
+  letter-spacing: 0.14em;
+  color: var(--dim);
+  text-transform: uppercase;
+  margin: 0.65rem 0 0.28rem;
+}
+.corr-textarea {
+  width: 100%;
+  background: var(--bg3);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  color: var(--text);
+  font-family: 'Share Tech Mono', monospace;
+  font-size: 0.7rem;
+  padding: 0.45rem 0.55rem;
+  outline: none;
+  resize: vertical;
+  min-height: 62px;
+  line-height: 1.6;
+  transition: border-color 0.15s;
+  box-sizing: border-box;
+}
+.corr-textarea:focus { border-color: var(--border2); }
+.corr-type-sel {
+  width: 100%;
+  background: var(--bg3);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  color: var(--text);
+  font-family: 'Share Tech Mono', monospace;
+  font-size: 0.68rem;
+  padding: 0.38rem 0.5rem;
+  outline: none;
+  cursor: pointer;
+  appearance: none;
+}
+.corr-action-row {
+  display: flex;
+  gap: 0.38rem;
+  flex-wrap: wrap;
+  margin: 0.65rem 0 0.3rem;
+  align-items: center;
+}
+.corr-action-btn {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--dim);
+  font-family: 'Share Tech Mono', monospace;
+  font-size: 0.58rem;
+  letter-spacing: 0.08em;
+  padding: 0.28rem 0.58rem;
+  border-radius: 3px;
+  cursor: pointer;
+  transition: color 0.12s, border-color 0.12s;
+  white-space: nowrap;
+}
+.corr-action-btn:hover { color: var(--ui); border-color: var(--ui); }
+.corr-action-btn.danger:hover { color: var(--danger); border-color: var(--danger); }
+.corr-action-btn:disabled { opacity: 0.35; cursor: not-allowed; }
+
+.corr-split-list { margin: 0.4rem 0; display: flex; flex-direction: column; gap: 0.22rem; }
+.corr-split-item {
+  font-family: 'Share Tech Mono', monospace;
+  font-size: 0.63rem;
+  color: var(--text);
+  background: var(--bg3);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 0.32rem 0.5rem;
+}
+.corr-split-line-btn {
+  display: block;
+  width: 100%;
+  background: transparent;
+  border: 1px dashed var(--border);
+  color: var(--dim);
+  font-family: 'Share Tech Mono', monospace;
+  font-size: 0.56rem;
+  letter-spacing: 0.1em;
+  padding: 0.22rem;
+  cursor: pointer;
+  border-radius: 2px;
+  transition: color 0.12s, border-color 0.12s;
+  text-align: center;
+}
+.corr-split-line-btn:hover { color: var(--ui); border-color: var(--ui); }
+
+.corr-order-hint {
+  font-family: 'Share Tech Mono', monospace;
+  font-size: 0.56rem;
+  color: var(--dim); opacity: 0.55;
+  margin-bottom: 0.55rem;
+  letter-spacing: 0.05em;
+}
+.corr-order-list { display: flex; flex-direction: column; gap: 0.28rem; }
+.corr-order-item {
+  display: flex; align-items: center; gap: 0.45rem;
+  background: var(--bg3);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 0.32rem 0.45rem;
+}
+.corr-order-num {
+  font-family: 'Share Tech Mono', monospace;
+  font-size: 0.6rem; color: var(--ui);
+  min-width: 1.1rem; flex-shrink: 0;
+}
+.corr-order-text {
+  flex: 1; font-family: 'Share Tech Mono', monospace;
+  font-size: 0.58rem; color: var(--dim);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.corr-order-btns { display: flex; gap: 0.25rem; flex-shrink: 0; }
+.corr-order-btns button {
+  background: transparent; border: 1px solid var(--border);
+  color: var(--dim); font-size: 0.62rem;
+  padding: 0.12rem 0.28rem; border-radius: 2px;
+  cursor: pointer; line-height: 1;
+  transition: color 0.12s, border-color 0.12s;
+}
+.corr-order-btns button:hover { color: var(--ui); border-color: var(--ui); }
+
+.corr-tl-text {
+  font-family: 'Crimson Pro', serif;
+  font-size: 0.9rem; color: var(--text); line-height: 1.5;
+  background: var(--bg3); border: 1px solid var(--border);
+  border-radius: 3px; padding: 0.38rem 0.55rem;
+  margin-top: 0.28rem;
+}
+.corr-footer {
+  display: flex; gap: 0.45rem;
+  background: var(--bg2);
+  border: 1px solid var(--border);
+  border-top: none;
+  border-radius: 0 0 4px 4px;
+  padding: 0.5rem 0.65rem;
+}
+.corr-btn-retrans, .corr-btn-close {
+  flex: 1; background: transparent;
+  font-family: 'Share Tech Mono', monospace;
+  font-size: 0.6rem; letter-spacing: 0.1em;
+  padding: 0.42rem 0.5rem; border-radius: 3px; cursor: pointer;
+  transition: background 0.12s, color 0.12s;
+}
+.corr-btn-retrans {
+  border: 1px solid var(--ui); color: var(--ui);
+}
+.corr-btn-retrans:hover { background: rgba(0,229,176,0.09); }
+.corr-btn-retrans:disabled { opacity: 0.38; cursor: not-allowed; }
+.corr-btn-close {
+  border: 1px solid var(--border); color: var(--dim);
+}
+.corr-btn-close:hover { color: var(--danger); border-color: var(--danger); }
+</style>
+</head>
+<body>
+
+<!-- ════════ HOME ════════ -->
+<div id="screen-home" class="screen active">
+  <div class="home-inner">
+
+    <div class="home-brand">
+      <div class="home-title">Manga<span>TL</span></div>
+      <div class="home-sub">MangaDex · EasyOCR+CLAHE · Multi-Provider AI</div>
+    </div>
+
+    <div class="form-group">
+      <label class="form-label" for="ai-model">AI Model</label>
+      <select id="ai-model" class="form-input" onchange="onModelChange()">
+        <optgroup label="✦ Free Tier (Google AI)">
+          <option value="gemini|gemini-3.5-flash">Gemini 3.5 Flash — Paid (best quality)</option>
+          <option value="gemini|gemini-3.1-flash-lite">Gemini 3.1 Flash-Lite — Free tier (fastest, budget)</option>
+          <option value="gemini|gemini-2.5-flash">Gemini 2.5 Flash — Paid (retiring Oct 2026)</option>
+        </optgroup>
+        <optgroup label="Google AI (Paid)">
+          <option value="gemini|gemini-3.1-pro-preview">Gemini 3.1 Pro — Paid (flagship)</option>
+        </optgroup>
+        <optgroup label="DeepSeek (Cheap ~$0.02–0.05/chapter)">
+          <option value="deepseek|deepseek-v4-flash">DeepSeek V4 Flash</option>
+          <option value="deepseek|deepseek-v4-pro">DeepSeek V4 Pro (best quality)</option>
+        </optgroup>
+      </select>
+    </div>
+
+    <div class="form-group">
+      <label class="form-label" for="ai-key">API Key</label>
+      <input id="ai-key" class="form-input" type="password"
+             placeholder="AIza…" autocomplete="off" spellcheck="false">
+    </div>
+
+    <div class="form-group" id="vision-ocr-group">
+      <label class="form-label" for="vision-ocr-mode">Vision OCR
+        <span style="font-size:0.7rem;opacity:0.55;font-weight:400;margin-left:0.3rem">(uses Gemini quota per page)</span>
+      </label>
+      <select id="vision-ocr-mode" class="form-input"
+              onchange="localStorage.setItem('mtl_vision_mode', this.value)">
+        <option value="smart">Smart — complex scripts only (saves quota)</option>
+        <option value="all">All languages — max quality</option>
+        <option value="off">Off — EasyOCR only, no quota used</option>
+      </select>
+    </div>
+
+    <div class="form-group">
+      <label class="form-label" for="chapter-url">MangaDex Chapter URL</label>
+      <input id="chapter-url" class="form-input" type="url" inputmode="url"
+             placeholder="https://mangadex.org/chapter/…"
+             autocomplete="off" spellcheck="false">
+    </div>
+
+    <div class="form-row-wrap">
+      <div class="form-row">
+        <div class="form-group">
+          <label class="form-label" for="target-lang">Translate To</label>
+          <select id="target-lang" class="form-input" onchange="onTargetLangChange()">
+            <optgroup label="— Common —">
+              <option value="English" selected>English</option>
+              <option value="Malay">Bahasa Melayu — Malay</option>
+              <option value="Indonesian">Bahasa Indonesia — Indonesian</option>
+              <option value="Filipino">Tagalog — Filipino</option>
+            </optgroup>
+            <optgroup label="— East Asian —">
+              <option value="Japanese">日本語 — Japanese</option>
+              <option value="Chinese (Simplified)">中文（简体）— Chinese (Simplified)</option>
+              <option value="Chinese (Traditional)">中文（繁體）— Chinese (Traditional)</option>
+              <option value="Korean">한국어 — Korean</option>
+            </optgroup>
+            <optgroup label="— South / Southeast Asian —">
+              <option value="Thai">ภาษาไทย — Thai</option>
+              <option value="Vietnamese">Tiếng Việt — Vietnamese</option>
+              <option value="Hindi">हिन्दी — Hindi</option>
+              <option value="Bengali">বাংলা — Bengali</option>
+              <option value="Tamil">தமிழ் — Tamil</option>
+              <option value="Burmese">မြန်မာဘာသာ — Burmese</option>
+              <option value="Khmer">ភាសាខ្មែរ — Khmer</option>
+            </optgroup>
+            <optgroup label="— European —">
+              <option value="Spanish">Español — Spanish</option>
+              <option value="French">Français — French</option>
+              <option value="German">Deutsch — German</option>
+              <option value="Portuguese">Português — Portuguese</option>
+              <option value="Portuguese (Brazil)">Português (Brasil) — Portuguese (BR)</option>
+              <option value="Italian">Italiano — Italian</option>
+              <option value="Russian">Русский — Russian</option>
+              <option value="Polish">Polski — Polish</option>
+              <option value="Dutch">Nederlands — Dutch</option>
+              <option value="Turkish">Türkçe — Turkish</option>
+              <option value="Ukrainian">Українська — Ukrainian</option>
+              <option value="Czech">Čeština — Czech</option>
+              <option value="Romanian">Română — Romanian</option>
+              <option value="Hungarian">Magyar — Hungarian</option>
+              <option value="Swedish">Svenska — Swedish</option>
+              <option value="Danish">Dansk — Danish</option>
+              <option value="Norwegian">Norsk — Norwegian</option>
+              <option value="Finnish">Suomi — Finnish</option>
+              <option value="Greek">Ελληνικά — Greek</option>
+            </optgroup>
+            <optgroup label="— Middle East / Africa —">
+              <option value="Arabic">العربية — Arabic</option>
+              <option value="Persian">فارسی — Persian</option>
+              <option value="Hebrew">עברית — Hebrew</option>
+              <option value="Swahili">Kiswahili — Swahili</option>
+            </optgroup>
+            <option value="__custom__">✏ Custom language…</option>
+          </select>
+          <input id="target-lang-custom" class="form-input" type="text"
+                 placeholder="Type language name, e.g. Javanese"
+                 autocomplete="off" spellcheck="false"
+                 style="display:none;margin-top:0.45rem">
+        </div>
+        <div class="form-group">
+          <label class="form-label" for="quality">Image Quality</label>
+          <select id="quality" class="form-input">
+            <option value="data-saver" selected>Data Saver (faster)</option>
+            <option value="data">Full Quality</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="form-group">
+        <label class="form-label" for="merge-scale">
+          Bubble Merge Sensitivity
+        </label>
+        <div class="merge-slider-row">
+          <input id="merge-scale" type="range"
+                 min="0.1" max="1.5" step="0.05" value="0.5"
+                 oninput="document.getElementById('merge-scale-val').textContent = parseFloat(this.value).toFixed(2)">
+          <span id="merge-scale-val" class="merge-slider-val">0.50</span>
+        </div>
+      </div>
+    </div>
+
+    <div>
+      <span class="read-order-label">Badge Reading Order</span>
+      <div class="read-order-row">
+        <button class="read-order-btn active" id="ro-auto-rtl" onclick="setReadOrder('auto-rtl')" title="Right&#8594;Left then Top&#8594;Bottom (standard manga)">
+          AUTO<br>&#8592; RTL
+        </button>
+        <button class="read-order-btn" id="ro-auto-ltr" onclick="setReadOrder('auto-ltr')" title="Left&#8594;Right then Top&#8594;Bottom (manhwa / webtoon)">
+          AUTO<br>LTR &#8594;
+        </button>
+        <button class="read-order-btn" id="ro-manual" onclick="setReadOrder('manual')" title="Keep OCR order &#8212; reorder per-page manually">
+          MANUAL<br>&#8597; DRAG
+        </button>
+      </div>
+    </div>
+
+    <button class="btn-go" onclick="startPipeline()">TRANSLATE CHAPTER</button>
+
+    <div class="md-login-wrap" id="md-login-wrap">
+      <button class="md-login-toggle" onclick="toggleMdLogin()">
+        <span>MangaDex Account <span style="font-size:0.7rem;opacity:0.6">(removes 10-chapter guest limit)</span></span>
+        <span style="display:flex;align-items:center;gap:0.6rem">
+          <span class="md-status">
+            <span class="md-status-dot" id="md-status-dot"></span>
+            <span id="md-status-text">Guest</span>
+          </span>
+          <span class="arrow">▶</span>
+        </span>
+      </button>
+      <div class="md-login-body">
+        <div class="md-login-hint">
+          Requires a <strong>personal API client</strong> on MangaDex.
+          Create one at <a href="https://mangadex.org/settings" target="_blank">mangadex.org → Settings → API Clients</a>,
+          then paste the Client ID and Secret below.
+        </div>
+        <div class="form-row" style="gap:0.6rem;margin-bottom:0.75rem">
+          <div class="form-group" style="flex:1;margin-bottom:0">
+            <label class="form-label" for="md-client-id">Client ID</label>
+            <input id="md-client-id" class="form-input" type="text"
+                   placeholder="…" autocomplete="off" spellcheck="false">
+          </div>
+          <div class="form-group" style="flex:1;margin-bottom:0">
+            <label class="form-label" for="md-client-secret">Client Secret</label>
+            <input id="md-client-secret" class="form-input" type="password"
+                   placeholder="…" autocomplete="off" spellcheck="false">
+          </div>
+        </div>
+        <div class="form-row" style="gap:0.6rem;margin-bottom:0.85rem">
+          <div class="form-group" style="flex:1;margin-bottom:0">
+            <label class="form-label" for="md-username">Username</label>
+            <input id="md-username" class="form-input" type="text"
+                   placeholder="your MangaDex username" autocomplete="off" spellcheck="false">
+          </div>
+          <div class="form-group" style="flex:1;margin-bottom:0">
+            <label class="form-label" for="md-password">Password</label>
+            <input id="md-password" class="form-input" type="password"
+                   placeholder="••••••••" autocomplete="off">
+          </div>
+        </div>
+        <button class="btn-md-login" id="md-login-btn" onclick="loginMangaDex()">Login</button>
+      </div>
+    </div>
+
+    <div class="home-cache-strip" id="home-cache-strip">
+      <div class="home-cache-info" id="home-cache-info">
+        <span class="cache-empty">No chapters cached yet</span>
+      </div>
+      <button class="btn-clear-cache-home" id="btn-clear-cache-home"
+              onclick="clearCacheFromHome()" disabled>🗑 CLEAR</button>
+    </div>
+
+    <div class="home-hint" id="ai-hint">
+      Get a free key at <a id="ai-key-link" href="https://aistudio.google.com/app/apikey" target="_blank">aistudio.google.com</a>
+      &nbsp;·&nbsp; English chapters display as-is
+    </div>
+
+  </div>
+</div>
+
+<!-- ════════ READER ════════ -->
+<div id="screen-reader" class="screen">
+
+  <div class="reader-header">
+    <div class="reader-header-top">
+      <button class="btn-back" onclick="goBack()">← BACK</button>
+      <div class="reader-titles">
+        <div class="reader-manga-title" id="manga-title">Loading…</div>
+        <div class="reader-ch-info" id="chapter-info">—</div>
+        <div class="reader-credit" id="chapter-credit"></div>
+      </div>
+    </div>
+    <div class="reader-header-bottom">
+      <div class="reader-status" id="reader-status">Fetching chapter…</div>
+      <div class="cache-pill" id="reader-cache-pill" title="Translation cache">
+        <span class="cache-pill-icon">💾</span>
+        <span class="cache-pill-label" id="reader-cache-label"><span>0</span> cached</span>
+        <button class="btn-cache-clear" id="reader-cache-clear-btn"
+                onclick="clearCacheFromReader()" title="Clear all cached chapters">✕ clear</button>
+      </div>
+    </div>
+    <div class="progress-track">
+      <div class="progress-fill" id="progress-fill"></div>
+    </div>
+  </div>
+
+  <div id="pages-container"></div>
+
+  <div id="nav-bar" class="nav-bar">
+    <button id="btn-prev" class="btn-nav" onclick="goToPrev()">← PREV CHAPTER</button>
+    <button id="btn-next" class="btn-nav" onclick="goToNext()">NEXT CHAPTER →</button>
+  </div>
+
+</div>
+
+<div id="toast"></div>
+
+<script>
+// ══════════════════════════════════════════════
+// STATE
+// ══════════════════════════════════════════════
+let cancelled        = false;
+let abortController  = null;
+let toastTimer       = null;
+let prevChapterId    = null;
+let nextChapterId    = null;
+let _activeChapterId = null;
+
+// ── Badge reading order ────────────────────────
+// 'auto-rtl' = right-to-left then top-to-bottom (manga default)
+// 'auto-ltr' = left-to-right then top-to-bottom (manhwa / webtoon)
+// 'manual'   = keep raw OCR order; per-page drag reorder available
+let _readOrder = localStorage.getItem('mtl_read_order') || 'auto-rtl';
+
+// Per-page manual order overrides: Map<"chId_pageIdx", number[]> (indices into original regions)
+const _manualOrder = new Map();
+
+// ══════════════════════════════════════════════
+// LANGUAGE NAMES
+// ══════════════════════════════════════════════
+const LANG_NAMES = {
+  vi: 'Vietnamese', it: 'Italian',    pt: 'Portuguese',
+  'pt-br': 'Portuguese (BR)',                           // FIX #7
+  ru: 'Russian',    fr: 'French',     es: 'Spanish',   de: 'German',
+  pl: 'Polish',     nl: 'Dutch',      tr: 'Turkish',   id: 'Indonesian',
+  ko: 'Korean',     ja: 'Japanese',   zh: 'Chinese',   'zh-hk': 'Chinese (Trad.)',
+  th: 'Thai',       ar: 'Arabic',     uk: 'Ukrainian', cs: 'Czech',
+  hu: 'Hungarian',  ro: 'Romanian',   sv: 'Swedish',   da: 'Danish',
+  fi: 'Finnish',    no: 'Norwegian',  ms: 'Malay',     hr: 'Croatian',
+  sk: 'Slovak',     bg: 'Bulgarian',  lt: 'Lithuanian', lv: 'Latvian',
+  en: 'English',
+};
+function getLangName(code) {
+  return LANG_NAMES[code?.toLowerCase()] ?? (code?.toUpperCase() ?? 'Unknown');
+}
+
+// ── Reading order control ─────────────────────
+function setReadOrder(mode) {
+  _readOrder = mode;
+  localStorage.setItem('mtl_read_order', mode);
+  ['auto-rtl', 'auto-ltr', 'manual'].forEach(m => {
+    document.getElementById('ro-' + m)?.classList.toggle('active', m === mode);
+  });
+}
+
+function _sortRegions(regions) {
+  if (_readOrder === 'auto-ltr') {
+    // Left-to-right, then top-to-bottom (manhwa)
+    return [...regions].sort((a, b) => a.cy - b.cy || a.cx - b.cx);
+  } else if (_readOrder === 'auto-rtl') {
+    // Right-to-left, then top-to-bottom (traditional manga)
+    return [...regions].sort((a, b) => a.cy - b.cy || b.cx - a.cx);
+  }
+  // manual — keep raw OCR order as returned by server
+  return [...regions];
+}
+
+// ══════════════════════════════════════════════
+// CACHE  (regions only — page URLs always re-fetched)
+// ══════════════════════════════════════════════
+const CACHE_PREFIX  = 'mtl_ch_';
+const CACHE_TTL     = 7 * 24 * 60 * 60 * 1000;
+const CACHE_MAX     = 20;   // FIX #6: proactive entry-count cap
+// Bump CACHE_V whenever the stored region format changes in a breaking way.
+// Old entries without this version are silently dropped and re-fetched.
+// v2: fixes badge positions — old caches may have fractional (0–1) x/y coords
+//     from un-normalised Vision OCR results, causing badges to land < 1% from
+//     the image edge and be invisible.  Fresh load with the fixed backend
+//     normalises coords correctly.
+// v4: Vision OCR prompt rewrite + removed responseMimeType:json + thinkingBudget:512
+//     so Flash-Lite actually reasons about spatial positions instead of hallucinating
+//     cx≈97 for every item.  Extreme right-cluster fallback redistributes badges
+//     to the left margin as a last resort when coords are still unreliable.
+const CACHE_V = 4;
+
+function getCachedChapter(chapterId) {
+  try {
+    const raw = localStorage.getItem(CACHE_PREFIX + chapterId);
+    if (!raw) return null;
+    const cached = JSON.parse(raw);
+    // Drop entries from older code versions (bad coordinate format)
+    if ((cached.v ?? 1) < CACHE_V) {
+      localStorage.removeItem(CACHE_PREFIX + chapterId);
+      return null;
+    }
+    if (Date.now() - cached.timestamp > CACHE_TTL) {
+      localStorage.removeItem(CACHE_PREFIX + chapterId);
+      return null;
+    }
+    return cached;
+  } catch { return null; }
+}
+
+function setCachedChapter(chapterId, data) {
+  // FIX #6: proactively drop oldest entries when over the cap, then keep
+  // evicting on quota errors until the write eventually succeeds.
+  const getKeys = () => Object.keys(localStorage).filter(k => k.startsWith(CACHE_PREFIX));
+  let keys = getKeys();
+  while (keys.length >= CACHE_MAX) {
+    if (!evictOldestCache()) break;
+    keys = getKeys();
+  }
+  const entry = JSON.stringify({ ...data, v: CACHE_V, timestamp: Date.now() });
+  for (let attempt = 0; attempt < 10; attempt++) {
+    try {
+      localStorage.setItem(CACHE_PREFIX + chapterId, entry);
+      return;
+    } catch {
+      if (!evictOldestCache()) return;  // nothing left to evict
+    }
+  }
+}
+
+// Returns the removed key, or null if nothing to evict
+function evictOldestCache() {
+  const keys = Object.keys(localStorage).filter(k => k.startsWith(CACHE_PREFIX));
+  if (!keys.length) return null;
+  let oldestKey = keys[0], oldestTime = Infinity;
+  keys.forEach(k => {
+    try {
+      const d = JSON.parse(localStorage.getItem(k));
+      if ((d.timestamp ?? 0) < oldestTime) { oldestTime = d.timestamp; oldestKey = k; }
+    } catch {}
+  });
+  localStorage.removeItem(oldestKey);
+  return oldestKey;
+}
+
+// ── Cache info helpers ────────────────────────
+function _getCacheKeys() {
+  return Object.keys(localStorage).filter(k => k.startsWith(CACHE_PREFIX));
+}
+
+function _getCacheSize() {
+  const keys = _getCacheKeys();
+  let bytes = 0;
+  keys.forEach(k => { try { bytes += (localStorage.getItem(k) || '').length * 2; } catch {} });
+  return { count: keys.length, bytes };
+}
+
+function _fmtBytes(b) {
+  if (b < 1024)       return b + ' B';
+  if (b < 1024*1024)  return (b/1024).toFixed(1) + ' KB';
+  return (b/1024/1024).toFixed(2) + ' MB';
+}
+
+function refreshCacheUI() {
+  const { count, bytes } = _getCacheSize();
+
+  // ── Reader header pill ──
+  const lbl = document.getElementById('reader-cache-label');
+  const clrBtn = document.getElementById('reader-cache-clear-btn');
+  if (lbl) {
+    lbl.innerHTML = count > 0
+      ? `<span>${count}</span> chapter${count !== 1 ? 's' : ''} · ${_fmtBytes(bytes)}`
+      : `<span style="color:var(--dim);font-weight:normal">empty</span>`;
+  }
+  if (clrBtn) clrBtn.style.display = count > 0 ? '' : 'none';
+
+  // ── Home screen strip ──
+  const info   = document.getElementById('home-cache-info');
+  const btn    = document.getElementById('btn-clear-cache-home');
+  if (info) {
+    if (count === 0) {
+      info.innerHTML = '<span class="cache-empty">No chapters cached yet</span>';
+    } else {
+      info.innerHTML =
+        `💾 <strong>${count}</strong> chapter${count !== 1 ? 's' : ''} cached` +
+        ` &nbsp;·&nbsp; <strong>${_fmtBytes(bytes)}</strong>`;
+    }
+  }
+  if (btn) btn.disabled = count === 0;
+}
+
+function clearCache() {
+  const keys = _getCacheKeys();
+  keys.forEach(k => localStorage.removeItem(k));
+  const n = keys.length;
+  toast(`Cleared ${n} cached chapter${n !== 1 ? 's' : ''}.`);
+  refreshCacheUI();
+}
+
+function clearCacheFromHome()   { clearCache(); }
+function clearCacheFromReader() {
+  clearCache();
+  // Also show confirmation near the pill
+  const lbl = document.getElementById('reader-cache-label');
+  if (lbl) {
+    lbl.innerHTML = '<span style="color:var(--ui)">cleared ✓</span>';
+    setTimeout(refreshCacheUI, 1800);
+  }
+}
+
+function updatePageInCache(pageIdx, regions) {
+  if (!_activeChapterId) return;
+  try {
+    const raw = localStorage.getItem(CACHE_PREFIX + _activeChapterId);
+    if (!raw) return;
+    const cached = JSON.parse(raw);
+    if (cached.pageRegions?.[pageIdx] !== undefined) {
+      cached.pageRegions[pageIdx] = regions;
+      localStorage.setItem(CACHE_PREFIX + _activeChapterId, JSON.stringify(cached));
+    }
+  } catch {}
+}
+
+// ══════════════════════════════════════════════
+// CONCURRENCY  (3 pages in parallel)           // FIX #4: removed stale Gemini comment
+// ══════════════════════════════════════════════
+async function runConcurrent(taskFns, limit = 3) {
+  let nextIdx = 0;
+  async function worker() {
+    while (nextIdx < taskFns.length && !cancelled) {
+      const i = nextIdx++;
+      await taskFns[i]();
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(limit, taskFns.length) }, worker));
+}
+
+// ══════════════════════════════════════════════
+// UI HELPERS
+// ══════════════════════════════════════════════
+function show(id) {
+  document.querySelectorAll('.screen').forEach(s => s.classList.remove('active'));
+  document.getElementById(id).classList.add('active');
+}
+function toast(msg, dur = 6000) {
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.style.display = 'block';
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => { t.style.display = 'none'; }, dur);
+}
+function setStatus(msg) { document.getElementById('reader-status').textContent = msg; }
+function setProgress(done, total) {
+  const pct = total > 0 ? Math.round((done / total) * 100) : 0;
+  document.getElementById('progress-fill').style.width = pct + '%';
+}
+function esc(s) {
+  return String(s ?? '')
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+function goBack() {
+  cancelled = true;
+  if (abortController) abortController.abort();
+  // Release per-chapter memory — OCR data, corrections, manual order.
+  _pageStore.clear();
+  _manualOrder.clear();
+  Object.keys(_corrWork).forEach(k => delete _corrWork[k]);
+  Object.keys(_corrMode).forEach(k => delete _corrMode[k]);
+  Object.keys(_corrSelId).forEach(k => delete _corrSelId[k]);
+  Object.keys(_corrDraw).forEach(k => delete _corrDraw[k]);
+  document.getElementById('pages-container').innerHTML = '';
+  show('screen-home');
+  refreshCacheUI();  // refresh home strip when returning
+}
+
+// ── Chapter navigation ──────────────────────
+function updateNavButtons() {
+  const bar = document.getElementById('nav-bar');
+  const p   = document.getElementById('btn-prev');
+  const n   = document.getElementById('btn-next');
+  const has = prevChapterId || nextChapterId;
+  bar.style.display     = has ? 'flex' : 'none';
+  p.style.visibility    = prevChapterId ? 'visible' : 'hidden';
+  p.style.pointerEvents = prevChapterId ? 'auto'    : 'none';
+  n.style.visibility    = nextChapterId ? 'visible' : 'hidden';
+  n.style.pointerEvents = nextChapterId ? 'auto'    : 'none';
+}
+function goToPrev() { if (prevChapterId) goToChapter(prevChapterId); }
+function goToNext() { if (nextChapterId) goToChapter(nextChapterId); }
+function goToChapter(chapterId) {
+  if (!chapterId) return;
+  window.scrollTo({ top: 0, behavior: 'instant' });
+  document.getElementById('chapter-url').value = `https://mangadex.org/chapter/${chapterId}`;
+  startPipelineWithId(chapterId);
+}
+
+// ══════════════════════════════════════════════
+// MANGADEX API  (routed via local proxy)
+// ══════════════════════════════════════════════
+function parseChapterId(url) {
+  const m = url.match(/chapter\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i);
+  return m ? m[1] : null;
+}
+
+async function fetchChapterMeta(id, signal) {
+  const authHeaders = await getMdHeaders();
+  const r = await fetch(`/mangadex/chapter/${id}?includes[]=manga&includes[]=scanlation_group`, { signal, headers: authHeaders });
+  if (!r.ok) {
+    const j = await r.json().catch(() => ({}));
+    throw new Error(j?.errors?.[0]?.detail || `MangaDex error ${r.status}`);
+  }
+  const { data } = await r.json();
+  const attrs    = data.attributes;
+  const mangaRel = data.relationships.find(x => x.type === 'manga');
+  const titles   = mangaRel?.attributes?.title ?? {};
+
+  // Collect all scanlation groups (a chapter can have more than one)
+  const groups = data.relationships
+    .filter(x => x.type === 'scanlation_group' && x.attributes?.name)
+    .map(x => ({ name: x.attributes.name, id: x.id }));
+
+  return {
+    mangaTitle:         titles.en ?? Object.values(titles)[0] ?? 'Unknown Manga',
+    mangaId:            mangaRel?.id ?? null,
+    chapter:            attrs.chapter ?? '?',
+    chapterTitle:       attrs.title   ?? '',
+    volume:             attrs.volume  ?? null,
+    translatedLanguage: attrs.translatedLanguage ?? 'en',
+    groups,
+  };
+}
+
+// FIX #12: returns {cdn, img} pairs instead of plain strings.
+//   cdn  — raw CDN HTTPS URL, used by /ocr (must be HTTPS for the proxy to accept)
+//   img  — routed through /proxy so all image traffic goes through the local server
+async function fetchPageUrls(id, quality, signal) {
+  const authHeaders = await getMdHeaders();
+  const r = await fetch(`/mangadex/at-home/server/${id}`, { signal, headers: authHeaders });
+  if (!r.ok) throw new Error(`Failed to get page server: ${r.status}`);
+  const { baseUrl, chapter } = await r.json();
+  let files, tier;
+  if (quality === 'data-saver' && chapter.dataSaver?.length) {
+    files = chapter.dataSaver; tier = 'data-saver';
+  } else {
+    files = chapter.data; tier = 'data';
+  }
+  return files.map(f => {
+    const cdn = `${baseUrl}/${tier}/${chapter.hash}/${f}`;
+    return { cdn, img: `/proxy?url=${encodeURIComponent(cdn)}` };
+  });
+}
+
+// FIX #5: paginate with offset instead of assuming 500 covers everything.
+//   Handles manga with 500+ chapters per language without silently missing
+//   the adjacent-chapter lookup.
+//
+// FIX #13: cache the full feed per (mangaId, lang) instead of re-paginating
+//   the entire chapter list on every single prev/next hop. For long-running
+//   series (500+ chapters) that was O(total chapters) network + JSON work
+//   just to answer an O(1) "what's next" question, every single navigation.
+//   A short in-session TTL keeps it from ever going too stale if a new
+//   chapter is uploaded mid-session.
+const _FEED_CACHE_TTL = 5 * 60 * 1000;  // 5 minutes — long enough to cover a reading session
+const _feedCache = new Map();  // key: `${mangaId}_${lang}` -> { chapters, timestamp }
+
+async function _getMangaFeed(mangaId, lang, signal) {
+  const cacheKey = `${mangaId}_${lang}`;
+  const cached   = _feedCache.get(cacheKey);
+  if (cached && (Date.now() - cached.timestamp) < _FEED_CACHE_TTL) {
+    return cached.chapters;
+  }
+
+  const LIMIT = 500;
+  const base  = `/mangadex/manga/${mangaId}/feed`
+    + `?translatedLanguage[]=${lang}&order[chapter]=asc&limit=${LIMIT}`
+    + `&contentRating[]=safe&contentRating[]=suggestive`
+    + `&contentRating[]=erotica&contentRating[]=pornographic`;
+  const authHeaders = await getMdHeaders();
+
+  let all = [], offset = 0, total = Infinity;
+  while (offset < total) {
+    const r = await fetch(`${base}&offset=${offset}`, { signal, headers: authHeaders });
+    if (!r.ok) throw new Error(`Feed fetch failed: ${r.status}`);
+    const body = await r.json();
+    total  = body.total ?? 0;
+    if (!body.data?.length) break;
+    all    = all.concat(body.data);
+    offset += body.data.length;
+  }
+  _feedCache.set(cacheKey, { chapters: all, timestamp: Date.now() });
+  return all;
+}
+
+async function fetchAdjacentChapters(mangaId, currentId, lang, signal) {
+  try {
+    const all = await _getMangaFeed(mangaId, lang, signal);
+    const idx = all.findIndex(ch => ch.id === currentId);
+    if (idx === -1) return { prev: null, next: null };
+    return {
+      prev: idx > 0            ? all[idx - 1].id : null,
+      next: idx < all.length-1 ? all[idx + 1].id : null,
+    };
+  } catch { return { prev: null, next: null }; }
+}
+
+// ══════════════════════════════════════════════
+// OCR  (runs on local proxy — no rate limit)
+// ══════════════════════════════════════════════
+// ── Per-page runtime store ─────────────────────────────────────────────────
+// Keyed by `${chapterId}_${pageIdx}`.  Holds cdnUrl, imgSrc, sourceLang,
+// rawBoxes (pre-merge fragments), and autoRegions from the last OCR run.
+const _pageStore = new Map();
+
+async function ocrPage(cdnUrl, lang, signal) {
+  const marginScale = parseFloat(document.getElementById('merge-scale')?.value ?? '0.5');
+  const info    = getModelInfo();
+  // Pass the Gemini key + model so the proxy can use Vision OCR.
+  // For DeepSeek users with no Gemini key, Vision OCR is skipped and
+  // EasyOCR is used as normal.
+  const aiKey   = info.provider === 'gemini'
+    ? (document.getElementById('ai-key')?.value?.trim() ?? '')
+    : '';
+  const aiModel = info.provider === 'gemini' ? getModelId() : '';
+  // vision_mode controls when Vision OCR fires:
+  //   'smart' — only for languages where EasyOCR struggles
+  //             (CJK, Arabic, Thai, Cyrillic, Vietnamese, and Latin heavy-diacritic languages)
+  //             Best for free-tier users: saves quota while still routing the hard cases through Vision
+  //   'all'   — every language
+  //   'off'   — never (EasyOCR only)
+  // DeepSeek users always get 'off' regardless of the select value.
+  const visionMode = info.provider === 'gemini'
+    ? (document.getElementById('vision-ocr-mode')?.value ?? 'smart')
+    : 'off';
+
+  const r = await fetch('/ocr', {
+    method: 'POST',
+    signal,
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      url: cdnUrl, lang, margin_scale: marginScale,
+      ai_key: aiKey, ai_model: aiModel, vision_mode: visionMode,
+    })
+  });
+  if (!r.ok) {
+    const err = await r.json().catch(() => ({}));
+    throw new Error(err?.description || `OCR error ${r.status}`);
+  }
+  const data = await r.json();
+  return {
+    regions:       data.regions        ?? [],
+    rawBoxes:      data.raw_boxes      ?? [],
+    visionFallback: data.vision_fallback ?? null,  // 'quota'|'error'|'network'|'parse'|null
+    ocrEngine:     data.ocr_engine     ?? "easyocr", // 'easyocr'|'vision'|'vision+easyocr'
+  };
+}
+
+// ══════════════════════════════════════════════
+// ══════════════════════════════════════════════
+// MANGADEX AUTH
+// ══════════════════════════════════════════════
+
+let _mdAccessToken  = null;
+let _mdRefreshToken = null;
+let _mdTokenExpiry  = 0;       // ms timestamp
+let _mdClientId     = '';
+let _mdClientSecret = '';
+let _mdUsername     = '';
+
+function toggleMdLogin() {
+  document.getElementById('md-login-wrap').classList.toggle('open');
+}
+
+function _setMdStatus(loggedIn, username = '') {
+  document.getElementById('md-status-dot').className =
+    'md-status-dot' + (loggedIn ? ' online' : '');
+  document.getElementById('md-status-text').textContent =
+    loggedIn ? `Logged in as ${username}` : 'Guest';
+  const btn = document.getElementById('md-login-btn');
+  btn.textContent = loggedIn ? 'Logout' : 'Login';
+  btn.onclick     = loggedIn ? logoutMangaDex : loginMangaDex;
+}
+
+function _saveMdTokens(accessToken, refreshToken, expiresIn, username) {
+  _mdAccessToken  = accessToken;
+  _mdRefreshToken = refreshToken;
+  _mdTokenExpiry  = Date.now() + expiresIn * 1000;
+  _mdUsername     = username;
+  localStorage.setItem('mtl_md_access',   accessToken);
+  localStorage.setItem('mtl_md_refresh',  refreshToken);
+  localStorage.setItem('mtl_md_expiry',   String(_mdTokenExpiry));
+  localStorage.setItem('mtl_md_username', username);
+}
+
+function _clearMdTokens() {
+  _mdAccessToken = _mdRefreshToken = null;
+  _mdTokenExpiry = 0; _mdUsername = '';
+  ['mtl_md_access','mtl_md_refresh','mtl_md_expiry','mtl_md_username'].forEach(k =>
+    localStorage.removeItem(k));
+}
+
+// Returns a valid access token, refreshing first if needed. Returns null if not logged in.
+async function getMdToken() {
+  if (!_mdAccessToken) return null;
+  if (Date.now() < _mdTokenExpiry - 60_000) return _mdAccessToken;  // still valid
+  // Try to refresh
+  try {
+    const res = await fetch('/auth/refresh', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        refresh_token: _mdRefreshToken,
+        client_id:     _mdClientId,
+        client_secret: _mdClientSecret,
+      }),
+    });
+    if (!res.ok) { _clearMdTokens(); _setMdStatus(false); return null; }
+    const d = await res.json();
+    _saveMdTokens(d.access_token, d.refresh_token, d.expires_in, _mdUsername);
+    return _mdAccessToken;
+  } catch {
+    return _mdAccessToken;  // network hiccup — try with old token
+  }
+}
+
+// Returns headers object with Authorization if logged in, otherwise just User-Agent.
+async function getMdHeaders() {
+  const token = await getMdToken();
+  return token ? { 'Authorization': `Bearer ${token}` } : {};
+}
+
+async function loginMangaDex() {
+  const clientId     = document.getElementById('md-client-id').value.trim();
+  const clientSecret = document.getElementById('md-client-secret').value.trim();
+  const username     = document.getElementById('md-username').value.trim();
+  const password     = document.getElementById('md-password').value.trim();
+  if (!clientId || !clientSecret || !username || !password) {
+    toast('Fill in all four MangaDex fields.'); return;
+  }
+  const btn = document.getElementById('md-login-btn');
+  btn.disabled = true; btn.textContent = 'Logging in…';
+  try {
+    const res = await fetch('/auth/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username, password, client_id: clientId, client_secret: clientSecret }),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err?.error_description || err?.error || `Login failed (${res.status})`);
+    }
+    const d = await res.json();
+    _mdClientId     = clientId;
+    _mdClientSecret = clientSecret;
+    _saveMdTokens(d.access_token, d.refresh_token, d.expires_in, username);
+    localStorage.setItem('mtl_md_client_id',     clientId);
+    localStorage.setItem('mtl_md_client_secret', clientSecret);
+    _setMdStatus(true, username);
+    // Clear password field — don't persist it
+    document.getElementById('md-password').value = '';
+    toast('MangaDex login successful ✓');
+  } catch (e) {
+    toast(`Login failed: ${e.message}`);
+    btn.disabled = false; btn.textContent = 'Login';
+  }
+}
+
+function logoutMangaDex() {
+  _clearMdTokens();
+  _setMdStatus(false);
+  toast('Logged out of MangaDex.');
+}
+
+// ══════════════════════════════════════════════
+// TRANSLATION  (multi-provider — proxied server-side)
+// ══════════════════════════════════════════════
+
+// FIX #2: valid type set used to sanitise AI classification output
+const VALID_TEXT_TYPES = new Set(['speech', 'thought', 'sfx', 'narration', 'sign']);
+
+// Model registry — value format: "provider|model-id"
+const MODEL_INFO = {
+  // Gemini models
+  'gemini|gemini-3.5-flash':              { provider: 'gemini',   placeholder: 'AIza…', label: 'Gemini 3.5 Flash',       keyUrl: 'https://aistudio.google.com/app/apikey', keySite: 'aistudio.google.com' },
+  'gemini|gemini-3.1-flash-lite':         { provider: 'gemini',   placeholder: 'AIza…', label: 'Gemini 3.1 Flash-Lite',  keyUrl: 'https://aistudio.google.com/app/apikey', keySite: 'aistudio.google.com' },
+  'gemini|gemini-2.5-flash':              { provider: 'gemini',   placeholder: 'AIza…', label: 'Gemini 2.5 Flash',       keyUrl: 'https://aistudio.google.com/app/apikey', keySite: 'aistudio.google.com' },
+  // Gemini models (paid flagship)
+  'gemini|gemini-3.1-pro-preview':        { provider: 'gemini',   placeholder: 'AIza…', label: 'Gemini 3.1 Pro',         keyUrl: 'https://aistudio.google.com/app/apikey', keySite: 'aistudio.google.com' },
+  // DeepSeek models
+  'deepseek|deepseek-v4-flash':           { provider: 'deepseek', placeholder: 'sk-…',  label: 'DeepSeek V4 Flash',      keyUrl: 'https://platform.deepseek.com',          keySite: 'platform.deepseek.com' },
+  'deepseek|deepseek-v4-pro':             { provider: 'deepseek', placeholder: 'sk-…',  label: 'DeepSeek V4 Pro',        keyUrl: 'https://platform.deepseek.com',          keySite: 'platform.deepseek.com' },
+};
+
+function getModelInfo() {
+  const val = document.getElementById('ai-model')?.value || 'gemini|gemini-3.5-flash';
+  return MODEL_INFO[val] || MODEL_INFO['gemini|gemini-3.5-flash'];
+}
+
+function getModelId() {
+  const val = document.getElementById('ai-model')?.value || '';
+  return val.split('|')[1] || 'gemini-3.5-flash';
+}
+
+function onModelChange() {
+  const info     = getModelInfo();
+  const keyEl    = document.getElementById('ai-key');
+  const linkEl   = document.getElementById('ai-key-link');
+  const hintEl   = document.getElementById('ai-hint');
+
+  // Save current key under the OLD provider before switching
+  if (keyEl) {
+    const prevProvider = keyEl.dataset.provider;
+    if (prevProvider && keyEl.value.trim()) {
+      localStorage.setItem(`mtl_key_${prevProvider}`, keyEl.value.trim());
+    }
+  }
+
+  // Load saved key for the NEW provider
+  const savedForProvider = localStorage.getItem(`mtl_key_${info.provider}`);
+  if (keyEl) {
+    keyEl.placeholder       = info.placeholder;
+    keyEl.dataset.provider  = info.provider;
+    keyEl.value             = savedForProvider || '';
+  }
+
+  if (linkEl) { linkEl.href = info.keyUrl; linkEl.textContent = info.keySite; }
+
+  if (hintEl) {
+    const freeTierModels = ['gemini|gemini-3.1-flash-lite'];
+    const modelVal = document.getElementById('ai-model')?.value || '';
+    const freeNote = freeTierModels.includes(modelVal)
+      ? ' (free tier — no credit card needed)'
+      : info.provider === 'gemini' ? ' (paid — billing required)' : ' (~$0.02–0.05/chapter)';
+    hintEl.textContent = `Get a free key at `;
+    const a = document.createElement('a');
+    a.id = 'ai-key-link'; a.href = info.keyUrl;
+    a.target = '_blank'; a.textContent = info.keySite;
+    hintEl.appendChild(a);
+    hintEl.appendChild(document.createTextNode(freeNote));
+  }
+
+  // Show Vision OCR mode only for Gemini; hide entirely for DeepSeek
+  const visionGroup = document.getElementById('vision-ocr-group');
+  if (visionGroup) {
+    const isGemini = info.provider === 'gemini';
+    visionGroup.style.display = isGemini ? '' : 'none';
+    // If switching TO a free-tier Gemini model, nudge toward 'smart' to protect quota —
+    // but only if the user hasn't explicitly changed it from the default themselves.
+    const freeTierModels2 = ['gemini|gemini-3.1-flash-lite'];
+    const modeEl = document.getElementById('vision-ocr-mode');
+    if (isGemini && modeEl && !localStorage.getItem('mtl_vision_mode')) {
+      modeEl.value = freeTierModels2.includes(document.getElementById('ai-model')?.value || '')
+        ? 'smart' : 'all';  // free-tier → 'smart' (protect quota); paid → 'all' (no quota concern)
+    }
+  }
+
+  localStorage.setItem('mtl_ai_model', document.getElementById('ai-model').value);
+}
+
+// ── Target language dropdown ──────────────────
+function onTargetLangChange() {
+  const sel    = document.getElementById('target-lang');
+  const custom = document.getElementById('target-lang-custom');
+  const isCustom = sel.value === '__custom__';
+  custom.style.display = isCustom ? 'block' : 'none';
+  if (isCustom) { custom.focus(); }
+  // Persist selection (value, not display label)
+  localStorage.setItem('mtl_target_lang', sel.value);
+}
+
+// Returns the effective target language string for the AI prompt
+function getTargetLang() {
+  const sel = document.getElementById('target-lang');
+  if (sel.value === '__custom__') {
+    const customEl = document.getElementById('target-lang-custom');
+    return (customEl.value.trim()) || localStorage.getItem('mtl_target_lang_custom') || 'English';
+  }
+  return sel.value || 'English';
+}
+
+// POST to /translate instead of calling provider APIs directly.
+// The API key is forwarded by the proxy and never appears in DevTools.
+// translateBatch accepts regions [{text,cx,cy}] — cx/cy help the AI
+// understand panel layout and infer reading order.
+async function translateBatch(regions, sourceLang, targetLang, signal) {
+  if (!regions.length) return [];
+  const key      = document.getElementById('ai-key').value.trim();
+  const info     = getModelInfo();
+  const modelId  = getModelId();
+  if (!key) throw new Error(`${info.label} API key not set.`);
+
+  // Attach index so the model can return items in any order and we re-map correctly
+  const items = regions.map((r, i) => ({
+    i,
+    text: r.text,
+    cx: r.cx,   // left–right position (0 = left edge, 100 = right edge)
+    cy: r.cy,   // top–bottom position (0 = top, 100 = bottom)
+  }));
+
+  // ── Hybrid noise filter ─────────────────────────────────────────────────────
+  // Single-character OCR detections are almost always screentone patterns,
+  // stray marks, or EasyOCR false positives — not real text. Sending them to
+  // the AI wastes tokens and triggers hallucinated "translations" of garbage.
+  // Filter them out before the API call; their `out` slots get pre-filled
+  // as { tl: '—', t: 'sfx' } below so the array length stays consistent.
+  // Note: the `i` values in meaningfulItems still reference original positions
+  // in `regions`, so the index-based re-mapping in the response loop is safe.
+  // Upper cap (150 chars): real speech bubbles rarely exceed this. An EasyOCR
+  // false-positive spanning a screentone or background pattern can produce a
+  // very long string that burns tokens without being translatable.
+  const meaningfulItems = items.filter(it => {
+    const len = it.text.trim().length;
+    return len >= 2 && len <= 150;
+  });
+  const sendItems = meaningfulItems.length ? meaningfulItems : items;
+
+  // Build fetch body once — reused across all retry attempts.
+  const _fetchBody = JSON.stringify({
+    provider:    info.provider,
+    key,
+    source_lang: sourceLang,   // proxy uses this to inject lang-specific hints
+    payload: {
+      model:       modelId,
+      temperature: 0.3,
+      // DeepSeek thinking models (V4 Pro) count reasoning tokens against max_tokens,
+      // so a budget of 4000 can be exhausted entirely on chain-of-thought before the
+      // model ever outputs a single character of JSON.  8000 gives ample headroom for
+      // both thinking (~3000–5000 tokens) and the JSON answer (~500–2000 tokens).
+      // Gemini: thinking tokens are counted separately (thinkingBudget=0 suppresses
+      // them entirely), so 8000 here only affects the JSON output length — safe.
+      max_tokens:  8000,
+      // DeepSeek JSON mode enforces a valid JSON object in the response.
+      // Gemini ignores this field (the proxy strips it before forwarding).
+      ...(info.provider === 'deepseek' ? { response_format: { type: 'json_object' } } : {}),
+      messages: [
+        {
+          role: 'system',
+          content:
+            `You are a manga translation expert. Translate ${sendItems.length} OCR-extracted text regions ` +
+            `from ${getLangName(sourceLang)} to ${targetLang}.\n\n` +
+            `SPATIAL DATA: Each item has cx (left-right % 0–100) and cy (top-bottom % 0–100).\n` +
+            `Use these to reconstruct reading order. Pages often have LEFT and RIGHT column panels — ` +
+            `items at similar cy but very different cx belong to DIFFERENT panels and should not be mixed.\n` +
+            `Within a single panel/column, read top-to-bottom (ascending cy).\n\n` +
+            `OCR ARTIFACTS TO FIX BEFORE TRANSLATING:\n` +
+            `- Words split with a hyphen (e.g. "PREGI-" followed by "DENTAL") → merge into one word ("PRESIDENTIAL")\n` +
+            `- A single speech bubble split into 2–3 nearby fragments → join them into one natural sentence\n` +
+            `- Stray single characters or obvious OCR noise → clean up or skip\n` +
+            `- ALL-CAPS OCR input is normal; translate into natural mixed-case output\n\n` +
+            `For each item classify the text type:\n` +
+            `  speech    — dialogue in speech bubbles\n` +
+            `  thought   — internal monologue (cloud / wavy bubbles)\n` +
+            `  sfx       — sound effects, onomatopoeia\n` +
+            `  narration — caption boxes, story narration\n` +
+            `  sign      — signs, labels, written environmental text\n\n` +
+            `SFX RULE: If a region is clearly an SFX or onomatopoeia, translate it as a brief English ` +
+            `sound effect wrapped in asterisks (e.g. *Rumble*, *Crash*, *Sigh*) — do NOT return \"-\" for these.\n` +
+            `Return ONLY a JSON object with a \"translations\" key containing exactly ${sendItems.length} items, ` +
+            `preserving the original i values:\n` +
+            `{\"translations\":[{\"i\":0,\"tl\":\"translated text\",\"t\":\"type\"},...]}\n` +
+            `If a region is pure noise with no translatable meaning, set tl to \"-\".\n` +
+            `No markdown fences, no explanation, no extra keys.`
+        },
+        { role: 'user', content: JSON.stringify(sendItems) }
+      ]
+    }
+  });
+
+  // 429 retry with exponential back-off.
+  // Free-tier Gemini and DeepSeek both rate-limit at high concurrency;
+  // retrying automatically is far better than dropping every page as an error card.
+  // Delays: 4 s → 8 s → 16 s (3 attempts). After that, throw so the caller shows an error.
+  const _RETRY_DELAYS = [4000, 8000, 16000];
+  let res, _attempt = 0;
+  while (true) {
+    res = await fetch('/translate', {
+      method: 'POST', signal,
+      headers: { 'Content-Type': 'application/json' },
+      body: _fetchBody,
+    });
+    if (res.status !== 429 || _attempt >= _RETRY_DELAYS.length) break;
+    const _wait = _RETRY_DELAYS[_attempt++];
+    toast(`Rate limited — retrying in ${_wait / 1000}s… (${_attempt}/${_RETRY_DELAYS.length})`, _wait + 500);
+    await new Promise(r => setTimeout(r, _wait));
+    if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+  }
+
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err?.error?.message || `${info.label} error ${res.status}`);
+  }
+
+  const data  = await res.json();
+  const text  = data.choices?.[0]?.message?.content ?? '';
+  const clean = text.replace(/```(?:json)?\n?/g, '').replace(/```/g, '').trim();
+
+  // Guard: an empty response means the proxy's upstream AI produced nothing
+  // (safety block, bad model ID, etc.).  Throw so the page renders as a
+  // retryable error card rather than silently showing all-"—" translations.
+  if (!clean) {
+    throw new Error(`${info.label} returned an empty response — check your API key / model, then retry.`);
+  }
+  // Accept {"translations":[...]} (DeepSeek JSON mode) or a bare array (Gemini/fallback).
+  // Parse strategies (tried in order; stop as soon as parsedArr is non-null):
+  //   1. Full JSON.parse — handles {"translations":[...]} and bare [...] directly.
+  //   2. Last-occurrence targeted — find the LAST "translations": key and slice the
+  //      JSON object from there.  Using LAST (not first) is critical for thinking
+  //      models that emit "translations" in their reasoning chain before the JSON.
+  //   3. Backwards object scan — find the last { before "translations" and parse
+  //      the whole object.  Handles "reasoning text\n{\n\"translations\":[...]}" shape.
+  //   4. Generic [...] last resort — any array anywhere in the text.
+  let parsedArr = null;
+  try {
+    const top = JSON.parse(clean);
+    if (Array.isArray(top))                        parsedArr = top;
+    else if (Array.isArray(top?.translations))      parsedArr = top.translations;
+  } catch { /* not valid top-level JSON — fall through */ }
+
+  // Strategy 2 — targeted, last occurrence of "translations" key
+  if (!parsedArr) {
+    const tlIdx = clean.lastIndexOf('"translations"');
+    if (tlIdx >= 0) {
+      const arrOpen = clean.indexOf('[', tlIdx);
+      const arrEnd  = clean.lastIndexOf(']');
+      if (arrOpen >= 0 && arrEnd > arrOpen) {
+        try { parsedArr = JSON.parse(clean.slice(arrOpen, arrEnd + 1)); } catch {}
+      }
+    }
+  }
+
+  // Strategy 3 — backwards object scan: find the { that opens the translations object
+  if (!parsedArr) {
+    const tlIdx = clean.lastIndexOf('"translations"');
+    if (tlIdx >= 0) {
+      const braceIdx = clean.lastIndexOf('{', tlIdx);
+      if (braceIdx >= 0) {
+        try {
+          const top2 = JSON.parse(clean.slice(braceIdx));
+          if (Array.isArray(top2?.translations)) parsedArr = top2.translations;
+        } catch {}
+      }
+    }
+  }
+
+  // Strategy 4 — generic [...] last resort
+  // /\[\[\s\S]*\]/ is intentionally last: greedy, breaks on any stray "[" earlier in text.
+  if (!parsedArr) {
+    const m = clean.match(/\[[\s\S]*\]/);
+    if (m) { try { parsedArr = JSON.parse(m[0]); } catch {} }
+  }
+
+  const fallback = () => regions.map(() => ({ tl: '\u2014', t: 'speech' }));
+  if (!parsedArr) {
+    // All parse strategies failed.  This is almost always a thinking-model leak:
+    // the server passed the DeepSeek reasoning chain (no JSON) instead of the answer.
+    // The V2 server fix intercepts this before it reaches here; this branch is the
+    // final diagnostic safety net.
+    const preview = clean.slice(0, 300);
+    console.error('[TL] All JSON parse strategies failed. Full response:', clean);
+    const isThinkingLeak = clean.length > 500 && !clean.includes('"translations"');
+    throw new Error(
+      'AI response could not be parsed as JSON (all 4 strategies failed).\n' +
+      (isThinkingLeak
+        ? 'The response is a thinking model reasoning chain — no JSON found.\n' +
+          'Fix: switch to DeepSeek V4 Flash (non-thinking) or Gemini 2.5 Flash.\n'
+        : 'Response preview: ' + (preview || '(empty)') + '\n') +
+      'Try a different model or retry.'
+    );
+  }
+  try {
+    const parsed = parsedArr;
+    if (!Array.isArray(parsed)) {
+      // JSON parsed but is an object without a translations array — unexpected schema.
+      console.error('[TL] Unexpected response schema (not array):', parsed);
+      throw new Error(
+        `AI returned unexpected JSON schema (expected array, got ${typeof parsed}). Retry the page.`
+      );
+    }
+    // Map back to original indices so overlay positions stay correct.
+    // BUG FIX: some models return "i" as a quoted string (e.g. "i":"0") rather
+    // than an integer.  parseInt handles both; the old `typeof item.i === 'number'`
+    // check would silently drop every item and produce all-"—" translations.
+    // Noise slots (filtered before the API call — too short < 2 or too long > 150)
+    // are pre-filled as sfx so they render as small red badges rather than empty
+    // speech bubbles.
+    const out = regions.map((_, i) => {
+      const len = items[i].text.trim().length;
+      return (len < 2 || len > 150)
+        ? { tl: '—', t: 'sfx' }
+        : { tl: '—', t: 'speech' };
+    });
+    // Each item is mapped independently: one malformed entry (unexpected
+    // shape, a getter that throws, etc.) is skipped in place rather than
+    // aborting the whole forEach and falling through to fallback(), which
+    // would previously discard every other item that parsed correctly.
+    let _skipped = 0;
+    parsed.forEach(item => {
+      try {
+        if (typeof item === 'string') return; // model ignored schema — skip
+        // Strict check: parseInt("3rd") === 3, which would silently accept a
+        // malformed index instead of rejecting it. Require the value to be a
+        // clean integer (as a number or a pure-digit string) before mapping.
+        const iRaw = item.i;
+        const iStr = String(iRaw ?? '').trim();
+        if (!/^\d+$/.test(iStr)) return;
+        const idx = parseInt(iStr, 10);
+        if (idx < 0 || idx >= regions.length) return;
+        out[idx] = {
+          tl: String(item.tl ?? item.translation ?? item.text ?? '—'),
+          t:  VALID_TEXT_TYPES.has(item.t) ? item.t : 'speech',
+        };
+      } catch (_itemErr) {
+        _skipped++;
+        console.warn('[TL] Skipped one malformed translation item:', item, _itemErr);
+      }
+    });
+    if (_skipped > 0) {
+      console.warn(`[TL] ${_skipped} of ${parsed.length} item(s) skipped due to malformed shape.`);
+    }
+    return out;
+  } catch (_err) {
+    // Only reached for genuine schema failures (e.g. parsed wasn't an array)
+    // thrown above — not for per-item issues, which are now handled inline.
+    console.error('[TL] Falling back to all-"—" translations for this page:', _err);
+    return fallback();
+  }
+}
+
+// ══════════════════════════════════════════════
+// RENDERING
+// ══════════════════════════════════════════════
+function addSkeleton(i) {
+  const el     = document.createElement('div');
+  el.className = 'page-card';
+  el.id        = `page-${i}`;
+  el.innerHTML = `<div class="page-skeleton">
+    <span class="sk-num">${i + 1}</span>
+    <div class="sk-bar"></div>
+  </div>`;
+  document.getElementById('pages-container').appendChild(el);
+  return el;
+}
+
+// Display-only: no translation panel (English chapters / full-art pages)
+function renderPageDisplay(el, pageIdx, total, imgSrc) {
+  el.innerHTML = `
+    <div class="img-wrap">
+      <img src="${esc(imgSrc)}" class="page-img page-img-only"
+           loading="lazy" alt="Page ${pageIdx + 1}">
+      <div class="pg-label">${pageIdx + 1} / ${total}</div>
+    </div>`;
+}
+
+// Full render: image + numbered badges + translation panel
+function renderPage(el, pageIdx, total, imgSrc, regions) {
+  // Apply any stored manual reorder for this page
+  const moKey = `${_activeChapterId}_${pageIdx}`;
+  const moIdx = _manualOrder.get(moKey);
+  const displayRegions = moIdx
+    ? moIdx.map(i => regions[i]).filter(Boolean)
+    : regions;
+
+  let badgesHtml = '';
+  let rowsHtml   = '';
+  displayRegions.forEach((r, i) => {
+    const tag = (r.t || 'speech').toLowerCase();
+    const cx  = r.x ?? 50;
+    const cy  = r.y ?? 50;
+    badgesHtml += `<div class="badge t-${tag}" style="left:${cx}%;top:${cy}%">${i + 1}</div>`;
+    rowsHtml   += `<div class="t-row">
+      <span class="t-num">${i + 1}</span>
+      <span class="t-tag ${tag}">${tag}</span>
+      <span class="t-text">${esc(r.tl || '—')}</span>
+    </div>`;
+  });
+
+  const hasRegions = displayRegions.length > 0;
+  const reorderBtn = hasRegions
+    ? `<button class="btn-reorder-page" id="ro-btn-${pageIdx}"
+         onclick="toggleReorderPanel(${pageIdx})" title="Manually reorder badges">⇅ ORDER</button>`
+    : '';
+  const panel = hasRegions
+    ? `<div class="trans-panel" id="trans-panel-${pageIdx}">${rowsHtml}</div>`
+    : `<div class="no-text-note">— no text detected —</div>`;
+
+  el.innerHTML = `
+    <div class="img-wrap">
+      <img src="${esc(imgSrc)}" class="page-img" loading="eager" alt="Page ${pageIdx + 1}">
+      ${badgesHtml}
+      <div class="pg-label">${pageIdx + 1} / ${total}</div>
+      <button class="btn-correct" onclick="openCorrection(${pageIdx})" title="Correct this page">✏ CORRECT</button>
+      ${reorderBtn}
+    </div>
+    ${panel}
+    <div class="reorder-panel" id="reorder-panel-${pageIdx}" style="display:none"></div>`;
+
+  // Store regions on the element for reorder access
+  el._regions = regions;
+}
+
+// FIX #12: cdnUrl (for OCR retries) and imgSrc (for display) are now separate.
+//          data-cdn / data-img are stored on the button so retryPage can use each correctly.
+function renderPageError(el, pageIdx, total, cdnUrl, imgSrc, errMsg, sourceLang) {
+  el.innerHTML = `
+    <div class="img-wrap">
+      <img src="${esc(imgSrc)}" class="page-img" loading="eager" alt="Page ${pageIdx + 1}">
+      <div class="pg-label">${pageIdx + 1} / ${total}</div>
+    </div>
+    <div class="page-err-note">
+      <span>${esc(errMsg)}</span>
+      <button class="btn-retry"
+        data-idx="${pageIdx}"
+        data-total="${total}"
+        data-cdn="${esc(cdnUrl)}"
+        data-img="${esc(imgSrc)}"
+        data-lang="${esc(sourceLang ?? '')}">↺ Retry</button>
+    </div>`;
+}
+
+document.addEventListener('click', e => {
+  const btn = e.target.closest('.btn-retry');
+  if (!btn || btn.disabled) return;
+  const el = btn.closest('.page-card');
+  retryPage(btn, el,
+    +btn.dataset.idx, +btn.dataset.total,
+    btn.dataset.cdn, btn.dataset.img, btn.dataset.lang);
+});
+
+// FIX #2: regions now use translated[j].t for type (was always hardcoded 'speech')
+// FIX #12: uses cdnUrl for OCR, imgSrc for display
+async function retryPage(btn, el, pageIdx, total, cdnUrl, imgSrc, sourceLang) {
+  btn.disabled    = true;
+  btn.textContent = 'Retrying…';
+  const targetLang = getTargetLang();
+  try {
+    const ocrData    = await ocrPage(cdnUrl, sourceLang);
+    const ocrResult  = ocrData.regions;
+    if (ocrData.visionFallback) {
+      const msgs = { quota: 'Gemini quota hit', error: 'Gemini Vision error', network: 'Network error', parse: 'Vision response unreadable' };
+      toast(`⚠ ${msgs[ocrData.visionFallback] ?? 'Vision OCR error'} — used EasyOCR as fallback.`);
+    }
+    // Store raw data so the correction UI can access it
+    _pageStore.set(`${_activeChapterId}_${pageIdx}`, {
+      cdnUrl, imgSrc, sourceLang, total,
+      rawBoxes: ocrData.rawBoxes,
+      autoRegions: ocrResult,
+      ocrEngine: ocrData.ocrEngine,
+    });
+    // Sort regions per user's reading order preference
+    const sortedOcr = _sortRegions(ocrResult);
+    const translated = await translateBatch(sortedOcr, sourceLang, targetLang);
+    const regions    = sortedOcr.map((r, j) => ({
+      text: r.text || '',   // needed so re-translate works if this page is cached
+      t:  translated[j]?.t  || 'speech',
+      x:  r.cx,
+      y:  r.cy,
+      box: r.box,
+      tl: translated[j]?.tl || '—',
+    }));
+    // Save translated data so correction UI gets real tl values
+    const _se = _pageStore.get(`${_activeChapterId}_${pageIdx}`);
+    if (_se) _se.sortedRegions = sortedOcr.map((r, j) => ({
+      text: r.text || '', t: translated[j]?.t || 'speech',
+      cx: r.cx, cy: r.cy, box: r.box,
+      raw_box_ids: r.raw_box_ids || [],
+      tl: translated[j]?.tl || '—',
+    }));
+    renderPage(el, pageIdx, total, imgSrc, regions);
+    updatePageInCache(pageIdx, regions);
+  } catch (err) {
+    btn.disabled    = false;
+    btn.textContent = '↺ Retry';
+    // Update the error note in-place so the user can read why the retry failed
+    // without relying on the disappearing toast alone.
+    const errNote = el?.querySelector('.page-err-note span');
+    if (errNote) errNote.textContent = err.message;
+    toast(`Retry failed: ${err.message}`);
+  }
+}
+
+// ══════════════════════════════════════════════
+// MAIN PIPELINE
+// ══════════════════════════════════════════════
+async function startPipeline() {
+  const key        = document.getElementById('ai-key').value.trim();
+  const rawUrl     = document.getElementById('chapter-url').value.trim();
+  const targetLang = getTargetLang();
+  const quality    = document.getElementById('quality').value;
+  const info       = getModelInfo();
+
+  if (!key) { toast(`Enter your ${info.label} API key.`); return; }
+
+  // Validate key format matches the selected provider
+  const keyIsGemini   = key.startsWith('AIza');
+  const keyIsDeepSeek = key.startsWith('sk-');
+  if (info.provider === 'gemini' && keyIsDeepSeek) {
+    toast('That looks like a DeepSeek key (sk-…).\nGemini keys start with AIza — get one at aistudio.google.com');
+    return;
+  }
+  if (info.provider === 'deepseek' && keyIsGemini) {
+    toast('That looks like a Gemini key (AIza…).\nDeepSeek keys start with sk- — get one at platform.deepseek.com');
+    return;
+  }
+
+  if (!rawUrl) { toast('Paste a MangaDex chapter URL.'); return; }
+
+  const chapterId = parseChapterId(rawUrl);
+  if (!chapterId) {
+    toast("Could not find a chapter ID.\nMake sure it's a mangadex.org/chapter/… link.");
+    return;
+  }
+  localStorage.setItem(`mtl_key_${info.provider}`, key);
+  startPipelineWithId(chapterId, quality, targetLang);
+}
+
+async function startPipelineWithId(chapterId, quality, targetLang) {
+  quality    = quality    || document.getElementById('quality').value;
+  targetLang = targetLang || getTargetLang();
+
+  cancelled = false;
+  if (abortController) abortController.abort();
+  abortController = new AbortController();
+  const signal = abortController.signal;
+
+  _activeChapterId = chapterId;
+  prevChapterId    = null;
+  nextChapterId    = null;
+
+  show('screen-reader');
+  refreshCacheUI();  // update pill count when entering reader
+  document.getElementById('pages-container').innerHTML = '';
+  document.getElementById('manga-title').textContent   = 'Loading…';
+  document.getElementById('chapter-info').textContent  = '';
+  updateNavButtons();
+  setProgress(0, 1);
+  setStatus('Fetching chapter info…');
+
+  try {
+    // ── 1. Chapter meta ───────────────────────
+    const meta       = await fetchChapterMeta(chapterId, signal);
+    const sourceLang = meta.translatedLanguage;
+    const isEnglish  = sourceLang === 'en';
+
+    document.getElementById('manga-title').textContent = meta.mangaTitle;
+    document.getElementById('chapter-info').textContent =
+      `Ch. ${meta.chapter}${meta.chapterTitle ? ' · ' + meta.chapterTitle : ''}` +
+      (meta.volume ? `  (Vol. ${meta.volume})` : '') +
+      (isEnglish ? '' : `  ·  ${getLangName(sourceLang)} → ${targetLang}`);
+
+    // Scanlation group credit
+    const creditEl = document.getElementById('chapter-credit');
+    if (meta.groups.length) {
+      // SECURITY: g.name / g.id come straight from the MangaDex API (a
+      // scanlation group's self-chosen display name) and are attacker-
+      // controlled. Every other innerHTML sink in this file escapes external
+      // text via esc() — this one didn't, which made it a stored-XSS gap
+      // sitting right next to the API keys this app keeps in localStorage.
+      const links = meta.groups.map(g =>
+        `<a href="https://mangadex.org/group/${esc(g.id)}" target="_blank" rel="noopener">${esc(g.name)}</a>`
+      ).join(' &amp; ');
+      creditEl.innerHTML = `Translated by ${links}`;
+    } else {
+      creditEl.textContent = '';
+    }
+
+    // ── 2. Page URLs ──────────────────────────
+    // FIX #12: urls is now [{cdn, img}] — cdn for OCR, img for <img> display
+    setStatus('Loading page list…');
+    const urls  = await fetchPageUrls(chapterId, quality, signal);
+    const total = urls.length;
+    if (total === 0) throw new Error('No pages found for this chapter.');
+
+    setProgress(0, total);
+    const skeletons = urls.map((_, i) => addSkeleton(i));
+
+    function resolveAdjacentChapters() {
+      if (!meta.mangaId) return;
+      const startedId = chapterId;
+      fetchAdjacentChapters(meta.mangaId, chapterId, sourceLang, signal)
+        .then(({ prev, next }) => {
+          if (_activeChapterId !== startedId || cancelled) return;
+          prevChapterId = prev; nextChapterId = next;
+          updateNavButtons();
+        });
+    }
+
+    // ── 3a. English — display only ────────────
+    if (isEnglish) {
+      urls.forEach((url, i) => {
+        renderPageDisplay(skeletons[i], i, total, url.img);
+        setProgress(i + 1, total);
+      });
+      setStatus(`Done · ${total} pages`);
+      resolveAdjacentChapters();
+      return;
+    }
+
+    // ── 3b. Non-English — cache hit? ──────────
+    const cached = getCachedChapter(chapterId);
+    if (cached && cached.targetLang === targetLang) {
+      document.getElementById('chapter-info').textContent += '  · ✓ cached';
+      setStatus('Loading from cache…');
+      urls.forEach((url, i) => {
+        const regions = cached.pageRegions[i];
+        if (regions?.length) {
+          // Populate _pageStore so ✏ CORRECT works on cached pages too.
+          // We don't have raw OCR boxes, but sortedRegions is enough for the
+          // correction sidebar to show real translations (tl / type).
+          _pageStore.set(`${_activeChapterId}_${i}`, {
+            cdnUrl: url.cdn, imgSrc: url.img, sourceLang, total,
+            rawBoxes: [],
+            autoRegions: regions.map(r => ({
+              text: r.text || '', cx: r.x ?? 50, cy: r.y ?? 50,
+              box:  r.box ?? [r.x-5, r.y-5, r.x+5, r.y+5],
+              raw_box_ids: [],
+            })),
+            sortedRegions: regions.map(r => ({
+              text: r.text || '', t: r.t || 'speech',
+              cx: r.x ?? 50, cy: r.y ?? 50,
+              box: r.box ?? [r.x-5, r.y-5, r.x+5, r.y+5],
+              raw_box_ids: [], tl: r.tl || '—',
+            })),
+          });
+          renderPage(skeletons[i], i, total, url.img, regions);
+        } else {
+          renderPageDisplay(skeletons[i], i, total, url.img);
+        }
+        setProgress(i + 1, total);
+      });
+      setStatus(`Done · ${total} pages · from cache`);
+      resolveAdjacentChapters();
+      return;
+    }
+
+    // ── 3c. Non-English — OCR + DeepSeek ──────
+    setStatus(`0 / ${total} pages translated`);
+    const pageRegions = new Array(total).fill(null);
+    let doneCount     = 0;
+    let _visionFallbackToasted = false;  // show at most one fallback toast per chapter
+
+    const tasks = urls.map((url, i) => async () => {
+      if (cancelled) return;
+      try {
+        // OCR: send raw CDN URL (must be HTTPS for the proxy)
+        const ocrData   = await ocrPage(url.cdn, sourceLang, signal);
+        const ocrResult = ocrData.regions;
+        if (cancelled) return;
+
+        // Surface Vision fallback once per chapter (quota hit / network error)
+        if (ocrData.visionFallback && !_visionFallbackToasted) {
+          _visionFallbackToasted = true;
+          const msgs = {
+            quota:   '⚠ Gemini quota hit — falling back to EasyOCR for remaining pages. Quality may be lower.',
+            error:   '⚠ Gemini Vision error — falling back to EasyOCR for remaining pages.',
+            network: '⚠ Network error reaching Gemini — falling back to EasyOCR (offline or quota reset needed).',
+            parse:   '⚠ Gemini Vision response unreadable — falling back to EasyOCR.',
+          };
+          toast(msgs[ocrData.visionFallback] ?? '⚠ Vision OCR fell back to EasyOCR.');
+        }
+
+        // Store raw OCR data so the correction UI can access it per-page
+        _pageStore.set(`${_activeChapterId}_${i}`, {
+          cdnUrl: url.cdn, imgSrc: url.img, sourceLang, total,
+          rawBoxes: ocrData.rawBoxes,
+          autoRegions: ocrResult,
+          ocrEngine: ocrData.ocrEngine,
+        });
+
+        if (!ocrResult.length) {
+          // Full-art page — nothing to translate
+          renderPageDisplay(skeletons[i], i, total, url.img);
+          pageRegions[i] = [];
+        } else {
+          // Translate + classify via DeepSeek (proxied)
+          // Sort regions per user's reading order preference
+          const sortedOcr = _sortRegions(ocrResult);
+          const translated = await translateBatch(sortedOcr, sourceLang, targetLang, signal);
+          // FIX #2: use translated[j].t (classified type) instead of hardcoded 'speech'
+          // BUG FIX: include `text` (original OCR source) so RE-TRANSLATE works correctly
+          // when this chapter is reloaded from the localStorage cache. Without it,
+          // retranslatePage filters out every region (r.text.trim() === '') and silently
+          // aborts with "No regions to translate." on every cached chapter.
+          const regions    = sortedOcr.map((r, j) => ({
+            text: r.text || '',
+            t:  translated[j]?.t  || 'speech',
+            x:  r.cx,
+            y:  r.cy,
+            box: r.box,
+            tl: translated[j]?.tl || '—',
+          }));
+          pageRegions[i] = regions;
+          renderPage(skeletons[i], i, total, url.img, regions);
+          // Store translated data back into _pageStore so the correction UI
+          // can show real translations instead of all-"—" fallbacks.
+          const _se = _pageStore.get(`${_activeChapterId}_${i}`);
+          if (_se) _se.sortedRegions = sortedOcr.map((r, j) => ({
+            text: r.text || '', t: translated[j]?.t || 'speech',
+            cx: r.cx, cy: r.cy, box: r.box,
+            raw_box_ids: r.raw_box_ids || [],
+            tl: translated[j]?.tl || '—',
+          }));
+        }
+      } catch (err) {
+        if (err.name === 'AbortError') return;
+        // FIX #12: pass both cdn (for retry OCR) and img (for display)
+        renderPageError(skeletons[i], i, total, url.cdn, url.img, err.message, sourceLang);
+      }
+      doneCount++;
+      setProgress(doneCount, total);
+      if (!cancelled) setStatus(`${doneCount} / ${total} pages translated`);
+    });
+
+    await runConcurrent(tasks, 3);
+
+    if (!cancelled) {
+      setStatus(`Done · ${total} pages`);
+      setCachedChapter(chapterId, { meta, targetLang, pageRegions });
+      refreshCacheUI();  // update pill after new chapter is cached
+      resolveAdjacentChapters();
+    }
+
+  } catch (err) {
+    if (err.name === 'AbortError') return;
+    toast(`Error: ${err.message}`);
+    show('screen-home');
+  }
+}
+
+// ══════════════════════════════════════════════
+// INIT
+// ══════════════════════════════════════════════
+(function init() {
+  // FIX #9: check the proxy is actually running; show a persistent warning if not
+  fetch('/health')
+    .then(r => { if (!r.ok) throw new Error(); })
+    .catch(() => toast('⚠ Proxy not detected — run manga_proxy.py first.', 15000));
+
+  // Restore badge reading order preference
+  const savedOrder = localStorage.getItem('mtl_read_order') || 'auto-rtl';
+  setReadOrder(savedOrder);
+
+  // Populate cache info on home screen
+  refreshCacheUI();
+
+  // Restore MangaDex login state
+  const savedAccess  = localStorage.getItem('mtl_md_access');
+  const savedRefresh = localStorage.getItem('mtl_md_refresh');
+  const savedExpiry  = parseInt(localStorage.getItem('mtl_md_expiry') || '0', 10);
+  const savedMdUser  = localStorage.getItem('mtl_md_username') || '';
+  _mdClientId     = localStorage.getItem('mtl_md_client_id')     || '';
+  _mdClientSecret = localStorage.getItem('mtl_md_client_secret') || '';
+  if (savedAccess && savedRefresh) {
+    _mdAccessToken  = savedAccess;
+    _mdRefreshToken = savedRefresh;
+    _mdTokenExpiry  = savedExpiry;
+    _mdUsername     = savedMdUser;
+    _setMdStatus(true, savedMdUser);
+    // Restore client ID field (not secret — keep that blank for privacy)
+    if (_mdClientId) document.getElementById('md-client-id').value = _mdClientId;
+    if (savedMdUser) document.getElementById('md-username').value  = savedMdUser;
+  }
+
+
+  const legacyKey = localStorage.getItem('mtl_ai_key');
+  if (legacyKey) {
+    const isGemini = legacyKey.startsWith('AIza');
+    localStorage.setItem(isGemini ? 'mtl_key_gemini' : 'mtl_key_deepseek', legacyKey);
+    localStorage.removeItem('mtl_ai_key');
+  }
+
+  const savedModel = localStorage.getItem('mtl_ai_model');
+  if (savedModel && document.querySelector(`#ai-model option[value="${savedModel}"]`)) {
+    document.getElementById('ai-model').value = savedModel;
+  }
+  onModelChange();  // restores per-provider key + syncs placeholder + hint + vision group visibility
+
+  // Restore Vision OCR mode — must run AFTER onModelChange so the select exists and is visible
+  const savedVisionMode = localStorage.getItem('mtl_vision_mode');
+  const visionEl = document.getElementById('vision-ocr-mode');
+  if (visionEl && savedVisionMode) {
+    visionEl.value = savedVisionMode;
+  }
+
+  const savedScale = localStorage.getItem('mtl_merge_scale');
+  if (savedScale) {
+    document.getElementById('merge-scale').value = savedScale;
+    document.getElementById('merge-scale-val').textContent = parseFloat(savedScale).toFixed(2);
+  }
+  document.getElementById('merge-scale').addEventListener('change', () => {
+    localStorage.setItem('mtl_merge_scale', document.getElementById('merge-scale').value);
+  });
+
+  // Restore saved target language
+  const savedTargetLang = localStorage.getItem('mtl_target_lang');
+  if (savedTargetLang) {
+    const sel = document.getElementById('target-lang');
+    const exists = Array.from(sel.options).some(o => o.value === savedTargetLang);
+    if (exists) {
+      sel.value = savedTargetLang;
+      onTargetLangChange();
+    } else if (savedTargetLang !== '__custom__') {
+      // Legacy plain-text value — put it in the custom field
+      sel.value = '__custom__';
+      document.getElementById('target-lang-custom').value = savedTargetLang;
+      document.getElementById('target-lang-custom').style.display = 'block';
+    }
+  }
+
+  document.getElementById('ai-key').addEventListener('blur', () => {
+    const keyEl = document.getElementById('ai-key');
+    const provider = keyEl.dataset.provider || getModelInfo().provider;
+    const val = keyEl.value.trim();
+    if (val) localStorage.setItem(`mtl_key_${provider}`, val);
+  });
+
+  document.getElementById('target-lang-custom').addEventListener('input', () => {
+    localStorage.setItem('mtl_target_lang_custom', document.getElementById('target-lang-custom').value.trim());
+  });
+
+  document.getElementById('chapter-url').addEventListener('keydown', e => {
+    if (e.key === 'Enter') startPipeline();
+  });
+})();
+
+// ══════════════════════════════════════════════
+// MANUAL BADGE REORDER  (per-page drag UI)
+// ══════════════════════════════════════════════
+
+function toggleReorderPanel(pageIdx) {
+  const panel = document.getElementById(`reorder-panel-${pageIdx}`);
+  const btn   = document.getElementById(`ro-btn-${pageIdx}`);
+  if (!panel) return;
+  const isOpen = panel.style.display !== 'none';
+  if (isOpen) {
+    panel.style.display = 'none';
+    btn?.classList.remove('active');
+  } else {
+    _renderReorderPage(pageIdx);
+    panel.style.display = 'block';
+    btn?.classList.add('active');
+  }
+}
+
+function _renderReorderPage(pageIdx) {
+  const panel = document.getElementById(`reorder-panel-${pageIdx}`);
+  if (!panel) return;
+  const card = document.getElementById(`page-${pageIdx}`);
+  const regions = card?._regions || [];
+  const moKey = `${_activeChapterId}_${pageIdx}`;
+  const order = _manualOrder.get(moKey) || regions.map((_, i) => i);
+
+  const items = order.map((origIdx, pos) => {
+    const r = regions[origIdx] || {};
+    const tag = (r.t || 'speech').toLowerCase();
+    const preview = (r.tl || '—').slice(0, 48) + ((r.tl || '').length > 48 ? '…' : '');
+    return `<li class="reorder-item" draggable="true"
+                data-pos="${pos}" data-orig="${origIdx}">
+      <span class="reorder-drag-handle" title="Drag to reorder">⠿</span>
+      <span class="reorder-badge-num t-${tag}">${pos + 1}</span>
+      <span class="reorder-item-text" title="${esc(r.tl || '—')}">${esc(preview)}</span>
+      <div class="reorder-arrow-btns">
+        <button onclick="_roMove(${pageIdx},${pos},-1)" ${pos === 0 ? 'disabled' : ''} title="Move up">↑</button>
+        <button onclick="_roMove(${pageIdx},${pos},1)"  ${pos === order.length - 1 ? 'disabled' : ''} title="Move down">↓</button>
+      </div>
+    </li>`;
+  }).join('');
+
+  panel.innerHTML = `
+    <div class="reorder-panel-hdr">
+      <span class="reorder-panel-title">⇅ Badge Reading Order</span>
+      <span class="reorder-hint">Drag or use ↑↓ — badge 1 reads first</span>
+    </div>
+    <ul class="reorder-list" id="ro-list-${pageIdx}">${items}</ul>
+    <button class="btn-apply-order" onclick="_applyReorder(${pageIdx})">✓ APPLY ORDER</button>`;
+
+  _initDragReorder(pageIdx);
+}
+
+function _roMove(pageIdx, pos, dir) {
+  const moKey  = `${_activeChapterId}_${pageIdx}`;
+  const card   = document.getElementById(`page-${pageIdx}`);
+  const regions = card?._regions || [];
+  const order  = [...(_manualOrder.get(moKey) || regions.map((_, i) => i))];
+  const newPos = pos + dir;
+  if (newPos < 0 || newPos >= order.length) return;
+  [order[pos], order[newPos]] = [order[newPos], order[pos]];
+  _manualOrder.set(moKey, order);
+  _renderReorderPage(pageIdx);
+  // Keep panel open
+  const panel = document.getElementById(`reorder-panel-${pageIdx}`);
+  if (panel) panel.style.display = 'block';
+}
+
+function _applyReorder(pageIdx) {
+  const moKey  = `${_activeChapterId}_${pageIdx}`;
+  const card   = document.getElementById(`page-${pageIdx}`);
+  const regions = card?._regions || [];
+  const order  = _manualOrder.get(moKey) || regions.map((_, i) => i);
+
+  // Re-render the translation panel with new order
+  const transPanelEl = document.getElementById(`trans-panel-${pageIdx}`);
+  const imgWrap = card?.querySelector('.img-wrap');
+  if (!transPanelEl || !imgWrap) return;
+
+  // Update badge numbers on image
+  const badges = imgWrap.querySelectorAll('.badge');
+  // Rebuild badge map: origIdx -> badge element
+  const badgeByOrig = {};
+  Array.from(badges).forEach((b, i) => { badgeByOrig[i] = b; });
+  // Re-number badges per new order
+  order.forEach((origIdx, newPos) => {
+    const b = badgeByOrig[origIdx];
+    if (b) b.textContent = String(newPos + 1);
+  });
+
+  // Rebuild translation rows
+  let rowsHtml = '';
+  order.forEach((origIdx, newPos) => {
+    const r = regions[origIdx] || {};
+    const tag = (r.t || 'speech').toLowerCase();
+    rowsHtml += `<div class="t-row">
+      <span class="t-num">${newPos + 1}</span>
+      <span class="t-tag ${tag}">${tag}</span>
+      <span class="t-text">${esc(r.tl || '—')}</span>
+    </div>`;
+  });
+  transPanelEl.innerHTML = rowsHtml;
+
+  toast('Badge order updated ✓');
+  // Close panel
+  const panel = document.getElementById(`reorder-panel-${pageIdx}`);
+  if (panel) panel.style.display = 'none';
+  document.getElementById(`ro-btn-${pageIdx}`)?.classList.remove('active');
+}
+
+function _initDragReorder(pageIdx) {
+  const list = document.getElementById(`ro-list-${pageIdx}`);
+  if (!list) return;
+  let draggedItem = null;
+
+  list.addEventListener('dragstart', e => {
+    draggedItem = e.target.closest('.reorder-item');
+    if (draggedItem) {
+      draggedItem.classList.add('dragging');
+      e.dataTransfer.effectAllowed = 'move';
+    }
+  });
+  list.addEventListener('dragend', () => {
+    draggedItem?.classList.remove('dragging');
+    list.querySelectorAll('.reorder-item').forEach(i => i.classList.remove('drag-over'));
+    draggedItem = null;
+  });
+  list.addEventListener('dragover', e => {
+    e.preventDefault();
+    const target = e.target.closest('.reorder-item');
+    if (!target || target === draggedItem) return;
+    list.querySelectorAll('.reorder-item').forEach(i => i.classList.remove('drag-over'));
+    target.classList.add('drag-over');
+  });
+  list.addEventListener('drop', e => {
+    e.preventDefault();
+    const target = e.target.closest('.reorder-item');
+    if (!target || !draggedItem || target === draggedItem) return;
+    const fromPos = +draggedItem.dataset.pos;
+    const toPos   = +target.dataset.pos;
+
+    const moKey   = `${_activeChapterId}_${pageIdx}`;
+    const card    = document.getElementById(`page-${pageIdx}`);
+    const regions = card?._regions || [];
+    const order   = [...(_manualOrder.get(moKey) || regions.map((_, i) => i))];
+
+    const [moved] = order.splice(fromPos, 1);
+    order.splice(toPos, 0, moved);
+    _manualOrder.set(moKey, order);
+    _renderReorderPage(pageIdx);
+    // Keep panel open
+    const panel = document.getElementById(`reorder-panel-${pageIdx}`);
+    if (panel) panel.style.display = 'block';
+  });
+}
+
+// ══════════════════════════════════════════════
+// CORRECTION UI
+// ══════════════════════════════════════════════
+
+const _corrMode  = {};  // pageIdx → 'select'|'draw'|'delete'|'reorder'
+const _corrSelId = {};  // pageIdx → selected region id (or null)
+const _corrWork  = {};  // pageIdx → working regions array
+const _corrDraw  = {};  // pageIdx → {active, x1, y1, x2, y2}
+
+// ── Helpers ───────────────────────────────────
+function _corrStoreKey(pageIdx)  { return `${_activeChapterId}_${pageIdx}`; }
+function _corrLocalKey(pageIdx)  { return `mtl_corr_${_activeChapterId}_${pageIdx}`; }
+
+function _saveCorrections(pageIdx) {
+  try {
+    localStorage.setItem(_corrLocalKey(pageIdx),
+      JSON.stringify({ regions: _corrWork[pageIdx], savedAt: Date.now() }));
+  } catch(e) { console.warn('Could not save corrections', e); }
+}
+
+function _loadCorrections(pageIdx) {
+  try {
+    const raw = localStorage.getItem(_corrLocalKey(pageIdx));
+    return raw ? JSON.parse(raw) : null;
+  } catch { return null; }
+}
+
+function _initWorkingRegions(pageIdx) {
+  const saved = _loadCorrections(pageIdx);
+  if (saved?.regions?.length) {
+    _corrWork[pageIdx] = JSON.parse(JSON.stringify(saved.regions));
+    return;
+  }
+  const pd = _pageStore.get(_corrStoreKey(pageIdx));
+  if (!pd) { _corrWork[pageIdx] = []; return; }
+  // Prefer sortedRegions (translated) over raw autoRegions so the correction
+  // sidebar shows real tl values instead of hardcoded '—' for every bubble.
+  const base = pd.sortedRegions || pd.autoRegions;
+  _corrWork[pageIdx] = base.map((r, i) => ({
+    id: i, text: r.text || '', t: r.t || 'speech',
+    cx: r.cx, cy: r.cy,
+    box: r.box || [r.cx-5, r.cy-5, r.cx+5, r.cy+5],
+    rawBoxIds: r.raw_box_ids || [],
+    deleted: false, isNew: false, tl: r.tl || '—',
+  }));
+}
+
+// ── Open / Close ──────────────────────────────
+function openCorrection(pageIdx) {
+  const card = document.getElementById(`page-${pageIdx}`);
+  if (!card) return;
+  const pd = _pageStore.get(_corrStoreKey(pageIdx));
+  if (!pd) { toast('Translate this page first, then use ✏ CORRECT.'); return; }
+
+  _corrMode[pageIdx]  = 'select';
+  _corrSelId[pageIdx] = null;
+  _initWorkingRegions(pageIdx);
+  card.classList.add('correcting');
+  card.querySelector('.btn-correct')?.classList.add('active');
+  card.innerHTML = _buildCorrHTML(pageIdx, pd.imgSrc);
+  _attachCorrDrawEvents(pageIdx, pd);
+  _renderCorrOverlay(pageIdx);
+}
+
+function closeCorrection(pageIdx) {
+  const card = document.getElementById(`page-${pageIdx}`);
+  if (!card) return;
+  card.classList.remove('correcting');
+  const pd = _pageStore.get(_corrStoreKey(pageIdx));
+  if (!pd) return;
+  // Rebuild normal page view from working (corrected) regions
+  const displayRegions = (_corrWork[pageIdx] || [])
+    .filter(r => !r.deleted)
+    .map(r => ({ t: r.t||'speech', x: r.cx, y: r.cy, box: r.box, tl: r.tl||'—' }));
+  renderPage(card, pageIdx, pd.total, pd.imgSrc, displayRegions);
+}
+
+// ── HTML builder ──────────────────────────────
+function _buildCorrHTML(pageIdx, imgSrc) {
+  return `
+<div class="corr-layout">
+  <div class="corr-left">
+    <div class="corr-toolbar" id="corr-tb-${pageIdx}">
+      <button class="corr-tool active" onclick="setCorrMode(${pageIdx},'select')">SELECT</button>
+      <button class="corr-tool" onclick="setCorrMode(${pageIdx},'draw')">＋ DRAW</button>
+      <button class="corr-tool" onclick="setCorrMode(${pageIdx},'vision-draw')" id="tb-vision-${pageIdx}" title="Draw a region and re-OCR it with Gemini Vision — replaces overlapping badge text">✦ VISION</button>
+      <button class="corr-tool" onclick="setCorrMode(${pageIdx},'delete')">✕ DELETE</button>
+      <button class="corr-tool" onclick="setCorrMode(${pageIdx},'reorder')">⇅ ORDER</button>
+    </div>
+    <div class="corr-img-wrap" id="corr-iw-${pageIdx}">
+      <img src="${esc(imgSrc)}" class="corr-img" id="corr-img-${pageIdx}" draggable="false">
+      <div class="corr-overlay mode-select" id="corr-ov-${pageIdx}"></div>
+    </div>
+  </div>
+  <div class="corr-sidebar" id="corr-sb-${pageIdx}">
+    <div class="corr-empty-hint">Click a region to edit<br>or use ＋ DRAW to add one.</div>
+  </div>
+</div>
+<div class="corr-footer">
+  <button class="corr-btn-retrans" id="corr-retrans-${pageIdx}" onclick="retranslatePage(${pageIdx})">↺ RE-TRANSLATE</button>
+  <button class="corr-btn-close" onclick="closeCorrection(${pageIdx})">CLOSE</button>
+</div>`;
+}
+
+// ── Overlay rendering ─────────────────────────
+function _renderCorrOverlay(pageIdx) {
+  const ov = document.getElementById(`corr-ov-${pageIdx}`);
+  if (!ov) return;
+  const mode    = _corrMode[pageIdx] || 'select';
+  const selId   = _corrSelId[pageIdx];
+  const regions = (_corrWork[pageIdx] || []).filter(r => !r.deleted);
+
+  ov.className  = `corr-overlay mode-${mode}`;
+  ov.innerHTML  = regions.map((r, vi) => {
+    const [x1,y1,x2,y2] = r.box;
+    const sel = r.id === selId;
+    return `<div class="corr-rbox${sel?' selected':''} mode-${mode}" id="rbox-${pageIdx}-${r.id}"
+      style="left:${x1}%;top:${y1}%;width:${x2-x1}%;height:${y2-y1}%" data-id="${r.id}">
+      <span class="rbox-num">${vi+1}</span>
+    </div>`;
+  }).join('');
+
+  ov.querySelectorAll('.corr-rbox').forEach(el => {
+    el.addEventListener('click', e => {
+      e.stopPropagation();
+      const id = parseInt(el.dataset.id);
+      if ((_corrMode[pageIdx]||'select') === 'delete') _deleteCorrRegion(pageIdx, id);
+      else _selectCorrRegion(pageIdx, id);
+    });
+  });
+}
+
+// ── Draw mode events ──────────────────────────
+function _attachCorrDrawEvents(pageIdx, pd) {
+  // Clean up any listeners left over from a previous openCorrection() call.
+  // When openCorrection() rebuilds card.innerHTML the old overlay element is
+  // destroyed without ever calling removeEventListener, orphaning the handlers
+  // on document.  We find the stale refs stored on the *old* overlay (which
+  // still exists in memory even after it was removed from the DOM) via the
+  // data attribute we save below, then remove them before attaching new ones.
+  const oldOvKey = `_corrOv_${pageIdx}`;
+  const oldOv = window[oldOvKey];
+  if (oldOv?._mmove) document.removeEventListener('mousemove', oldOv._mmove);
+  if (oldOv?._mup)   document.removeEventListener('mouseup',   oldOv._mup);
+
+  const ov  = document.getElementById(`corr-ov-${pageIdx}`);
+  const img = document.getElementById(`corr-img-${pageIdx}`);
+  if (!ov || !img) return;
+  _corrDraw[pageIdx] = { active: false };
+
+  ov.addEventListener('mousedown', e => {
+    const curMode = _corrMode[pageIdx]||'select';
+    if (curMode !== 'draw' && curMode !== 'vision-draw') return;
+    e.preventDefault();
+    const [x, y] = _imgPct(e, img);
+    _corrDraw[pageIdx] = { active:true, x1:x, y1:y, x2:x, y2:y };
+    _drawPreview(pageIdx);
+  });
+
+  const mmove = e => {
+    if (!_corrDraw[pageIdx]?.active) return;
+    const img2 = document.getElementById(`corr-img-${pageIdx}`);
+    if (!img2) return;
+    const [x,y] = _imgPct(e, img2);
+    _corrDraw[pageIdx].x2 = x; _corrDraw[pageIdx].y2 = y;
+    _drawPreview(pageIdx);
+    // In vision-draw mode: live-highlight any region that would be replaced
+    const curMode = _corrMode[pageIdx]||'select';
+    const ov2 = document.getElementById(`corr-ov-${pageIdx}`);
+    if (curMode === 'vision-draw' && ov2) {
+      const bx1=Math.min(_corrDraw[pageIdx].x1,x), by1=Math.min(_corrDraw[pageIdx].y1,y);
+      const bx2=Math.max(_corrDraw[pageIdx].x1,x), by2=Math.max(_corrDraw[pageIdx].y1,y);
+      const hit = _findOverlappingRegion(pageIdx, [bx1,by1,bx2,by2]);
+      ov2.querySelectorAll('.corr-rbox').forEach(el => {
+        el.classList.toggle('vision-replace-target', hit && parseInt(el.dataset.id) === hit.id);
+      });
+    }
+  };
+  const mup = async e => {
+    if (!_corrDraw[pageIdx]?.active) return;
+    _corrDraw[pageIdx].active = false;
+    const d = _corrDraw[pageIdx];
+    document.getElementById(`corr-ov-${pageIdx}`)?.querySelector('.draw-preview')?.remove();
+    // Clear any replace-target highlights
+    document.getElementById(`corr-ov-${pageIdx}`)
+      ?.querySelectorAll('.vision-replace-target')
+      .forEach(el => el.classList.remove('vision-replace-target'));
+    const x1=Math.min(d.x1,d.x2), y1=Math.min(d.y1,d.y2);
+    const x2=Math.max(d.x1,d.x2), y2=Math.max(d.y1,d.y2);
+    if ((x2-x1)<1 || (y2-y1)<1) return;
+    const curMode = _corrMode[pageIdx]||'select';
+    await _finalizeBox(pageIdx, [x1,y1,x2,y2], pd, curMode === 'vision-draw');
+  };
+  document.addEventListener('mousemove', mmove);
+  document.addEventListener('mouseup', mup);
+  // store refs on element for cleanup on next openCorrection()
+  ov._mmove = mmove; ov._mup = mup;
+  window[`_corrOv_${pageIdx}`] = ov;
+}
+
+function _imgPct(e, imgEl) {
+  const r = imgEl.getBoundingClientRect();
+  return [
+    Math.max(0, Math.min(100, (e.clientX-r.left)/r.width*100)),
+    Math.max(0, Math.min(100, (e.clientY-r.top)/r.height*100)),
+  ];
+}
+
+function _drawPreview(pageIdx) {
+  const ov = document.getElementById(`corr-ov-${pageIdx}`);
+  if (!ov) return;
+  const d = _corrDraw[pageIdx];
+  const x1=Math.min(d.x1,d.x2), y1=Math.min(d.y1,d.y2);
+  const x2=Math.max(d.x1,d.x2), y2=Math.max(d.y1,d.y2);
+  let p = ov.querySelector('.draw-preview');
+  if (!p) { p = document.createElement('div'); p.className='draw-preview'; ov.appendChild(p); }
+  const isVision = (_corrMode[pageIdx]||'select') === 'vision-draw';
+  p.classList.toggle('vision-mode', isVision);
+  p.style.cssText = `left:${x1}%;top:${y1}%;width:${x2-x1}%;height:${y2-y1}%`;
+}
+
+// ── IoU overlap helpers ───────────────────────
+// Returns Intersection-over-Union for two [x1,y1,x2,y2] boxes (% coords).
+function _iou(a, b) {
+  const ix1=Math.max(a[0],b[0]), iy1=Math.max(a[1],b[1]);
+  const ix2=Math.min(a[2],b[2]), iy2=Math.min(a[3],b[3]);
+  const inter = Math.max(0,ix2-ix1) * Math.max(0,iy2-iy1);
+  if (!inter) return 0;
+  const aA=(a[2]-a[0])*(a[3]-a[1]), bA=(b[2]-b[0])*(b[3]-b[1]);
+  return inter / (aA + bA - inter);
+}
+
+// Find the existing (non-deleted) region whose box most overlaps `box`.
+// Returns the region object if IoU > 0.35, else null.
+function _findOverlappingRegion(pageIdx, box) {
+  const regions = (_corrWork[pageIdx]||[]).filter(r => !r.deleted && r.box);
+  let best = null, bestScore = 0.35; // min threshold
+  for (const r of regions) {
+    const score = _iou(box, r.box);
+    if (score > bestScore) { best = r; bestScore = score; }
+  }
+  return best;
+}
+
+async function _finalizeBox(pageIdx, box, pd, useVision = false) {
+  const img = document.getElementById(`corr-img-${pageIdx}`);
+  if (!img) return;
+  const nw=img.naturalWidth, nh=img.naturalHeight;
+  const pxBox = [
+    Math.round(box[0]/100*nw), Math.round(box[1]/100*nh),
+    Math.round(box[2]/100*nw), Math.round(box[3]/100*nh),
+  ];
+  const sb = document.getElementById(`corr-sb-${pageIdx}`);
+
+  // ── Vision-draw: check for overlapping region FIRST ──────────────────────
+  // If the drawn box substantially overlaps an existing region, Vision Draw
+  // should REPLACE that region's text (better re-read) rather than stacking
+  // a duplicate badge on top of it.
+  const overlapping = useVision ? _findOverlappingRegion(pageIdx, box) : null;
+
+  if (sb) sb.innerHTML = `<div class="corr-empty-hint">${
+    useVision
+      ? (overlapping ? '✦ Re-reading with Gemini Vision…' : '✦ Gemini Vision OCR…')
+      : 'Running OCR on selection…'
+  }</div>`;
+
+  let ocrText = '';
+  if (useVision) {
+    // ── /vision-crop — Gemini reads the cropped region ─────────────────────
+    const key     = document.getElementById('ai-key')?.value?.trim() || '';
+    const modelId = getModelId();
+    if (!key) { toast('Gemini API key required for Vision Draw.'); return; }
+    try {
+      const res = await fetch('/vision-crop', {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({ url: pd.cdnUrl, box: pxBox,
+                               lang: pd.sourceLang, ai_key: key, ai_model: modelId }),
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        toast(`Vision crop error: ${err?.description || `HTTP ${res.status}`}`);
+      } else {
+        const data = await res.json();
+        ocrText = data.text || '';
+      }
+    } catch(e) { toast(`Vision crop failed: ${e.message}`); }
+  } else {
+    // ── /ocr-crop — EasyOCR reads the cropped region ───────────────────────
+    try {
+      const res = await fetch('/ocr-crop', {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({ url: pd.cdnUrl, box: pxBox, lang: pd.sourceLang }),
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        toast(`OCR crop error: ${err?.description || `HTTP ${res.status}`}`);
+      } else {
+        const data = await res.json();
+        ocrText = data.text || '';
+      }
+    } catch(e) { toast(`OCR crop failed: ${e.message}`); }
+  }
+
+  _corrMode[pageIdx] = 'select';
+  _updateToolbar(pageIdx);
+
+  if (useVision && overlapping) {
+    // ── REPLACE MODE: update existing region's text in place ────────────────
+    // Don't create a new badge — just overwrite the text. The user can then
+    // hit ↺ to re-translate the corrected OCR text.
+    overlapping.text = ocrText;
+    _saveCorrections(pageIdx);
+    _renderCorrOverlay(pageIdx);
+    _selectCorrRegion(pageIdx, overlapping.id);
+    const vis = (_corrWork[pageIdx]||[]).filter(r=>!r.deleted).findIndex(r=>r.id===overlapping.id)+1;
+    toast(`✦ Vision re-read Region ${vis}${ocrText ? '' : ' (no text detected)'}`);
+  } else {
+    // ── ADD MODE: create new region (same as original Draw behavior) ────────
+    const newId = Date.now();
+    const cx=(box[0]+box[2])/2, cy=(box[1]+box[3])/2;
+    _corrWork[pageIdx].push({ id:newId, text:ocrText, t:'speech', cx, cy, box, rawBoxIds:[], deleted:false, isNew:true, tl:'—' });
+    _renderCorrOverlay(pageIdx);
+    _selectCorrRegion(pageIdx, newId);
+    _saveCorrections(pageIdx);
+    if (useVision) toast(`✦ Vision added new region${ocrText ? '' : ' (no text — draw more precisely?)'}`);
+  }
+}
+
+// ── Select + sidebar ──────────────────────────
+function _selectCorrRegion(pageIdx, id) {
+  _corrSelId[pageIdx] = id;
+  _renderCorrOverlay(pageIdx);
+  _renderCorrSidebar(pageIdx);
+}
+
+function _renderCorrSidebar(pageIdx) {
+  const sb = document.getElementById(`corr-sb-${pageIdx}`);
+  if (!sb) return;
+  const mode = _corrMode[pageIdx] || 'select';
+  if (mode === 'reorder') { _renderReorderSidebar(pageIdx); return; }
+  const id = _corrSelId[pageIdx];
+  if (id == null) { sb.innerHTML=`<div class="corr-empty-hint">Click a region to edit<br>or use ＋ DRAW to add one.</div>`; return; }
+  const regions = _corrWork[pageIdx] || [];
+  const r = regions.find(x => x.id === id);
+  if (!r) return;
+  const vis     = regions.filter(x=>!x.deleted).findIndex(x=>x.id===id)+1;
+  const others  = regions.filter(x=>!x.deleted && x.id!==id);
+  const canSplit = (r.rawBoxIds||[]).length > 1;
+  const mergeOpts = others.map((o,oi)=>{
+    const ovi = regions.filter(x=>!x.deleted).findIndex(x=>x.id===o.id)+1;
+    return `<option value="${o.id}">Region ${ovi}</option>`;
+  }).join('');
+
+  sb.innerHTML = `
+    <div class="corr-sid-title">REGION ${vis}</div>
+    <div class="corr-sid-label">OCR TEXT</div>
+    <textarea class="corr-textarea" id="cta-${pageIdx}-${id}" rows="4">${esc(r.text)}</textarea>
+    <div class="corr-sid-label">TYPE</div>
+    <select class="corr-type-sel" id="ctype-${pageIdx}-${id}">
+      ${['speech','thought','sfx','narration','sign'].map(t=>`<option value="${t}"${r.t===t?' selected':''}>${t}</option>`).join('')}
+    </select>
+    <div class="corr-action-row">
+      ${canSplit?`<button class="corr-action-btn" onclick="_showSplitUI(${pageIdx},${id})">SPLIT</button>`:''}
+      ${others.length?`
+        <select class="corr-type-sel" id="cmerge-${pageIdx}-${id}" style="flex:1">
+          <option value="">Merge with…</option>${mergeOpts}
+        </select>
+        <button class="corr-action-btn" onclick="_doMerge(${pageIdx},${id})">MERGE</button>`:''}
+    </div>
+    <button class="corr-action-btn danger" style="width:100%;margin-top:0.5rem" onclick="_deleteCorrRegion(${pageIdx},${id})">DELETE REGION</button>
+    <div class="corr-sid-label" style="display:flex;align-items:center;justify-content:space-between">
+      TRANSLATION
+      <button id="crr-${pageIdx}-${id}" class="corr-action-btn"
+        style="padding:0.1rem 0.6rem;font-size:0.75rem;margin:0"
+        title="Re-translate this region using the rest of the page as context"
+        onclick="retranslateRegion(${pageIdx},${id})">↺</button>
+    </div>
+    <div class="corr-tl-text" id="ctl-${pageIdx}-${id}">${esc(r.tl||'—')}</div>`;
+
+  document.getElementById(`cta-${pageIdx}-${id}`)?.addEventListener('input', e=>{
+    const reg = (_corrWork[pageIdx]||[]).find(x=>x.id===id);
+    if (reg) { reg.text=e.target.value; _saveCorrections(pageIdx); }
+  });
+  document.getElementById(`ctype-${pageIdx}-${id}`)?.addEventListener('change', e=>{
+    const reg = (_corrWork[pageIdx]||[]).find(x=>x.id===id);
+    if (reg) { reg.t=e.target.value; _saveCorrections(pageIdx); _renderCorrOverlay(pageIdx); }
+  });
+}
+
+// ── Split UI ──────────────────────────────────
+function _showSplitUI(pageIdx, regionId) {
+  const sb = document.getElementById(`corr-sb-${pageIdx}`);
+  if (!sb) return;
+  const pd = _pageStore.get(_corrStoreKey(pageIdx));
+  const r  = (_corrWork[pageIdx]||[]).find(x=>x.id===regionId);
+  if (!r || !pd) return;
+
+  const rawBoxes = (r.rawBoxIds||[]).map(i=>pd.rawBoxes?.[i]).filter(Boolean)
+    .sort((a,b)=>a.box[1]-b.box[1]);
+  if (rawBoxes.length < 2) { toast('Not enough sub-boxes to split.'); return; }
+
+  // Highlight raw boxes on overlay
+  _renderCorrOverlay(pageIdx);
+  const ov = document.getElementById(`corr-ov-${pageIdx}`);
+  rawBoxes.forEach((b,i)=>{
+    const d=document.createElement('div'); d.className='corr-raw-box';
+    const [x1,y1,x2,y2]=b.box;
+    d.style.cssText=`left:${x1}%;top:${y1}%;width:${x2-x1}%;height:${y2-y1}%`;
+    d.innerHTML=`<span class="rbox-num raw">${i+1}</span>`;
+    ov?.appendChild(d);
+  });
+
+  const items = rawBoxes.map((b,i)=>`
+    <div class="corr-split-item">${esc(b.text)}</div>
+    ${i<rawBoxes.length-1?`<button class="corr-split-line-btn" onclick="_confirmSplit(${pageIdx},${regionId},${i})">── split here ──</button>`:''}`).join('');
+
+  sb.innerHTML = `
+    <div class="corr-sid-title">SPLIT REGION</div>
+    <div class="corr-split-list">${items}</div>
+    <button class="corr-action-btn" style="margin-top:0.8rem;width:100%" onclick="_selectCorrRegion(${pageIdx},${regionId})">CANCEL</button>`;
+}
+
+function _confirmSplit(pageIdx, regionId, splitAfterIdx) {
+  const pd = _pageStore.get(_corrStoreKey(pageIdx));
+  const regions = _corrWork[pageIdx];
+  if (!pd||!regions) return;
+  const rIdx = regions.findIndex(x=>x.id===regionId);
+  if (rIdx===-1) return;
+  const r = regions[rIdx];
+  const rawBoxes = (r.rawBoxIds||[]).map(i=>pd.rawBoxes?.[i]).filter(Boolean)
+    .sort((a,b)=>a.box[1]-b.box[1]);
+
+  const groupA = rawBoxes.slice(0, splitAfterIdx+1);
+  const groupB = rawBoxes.slice(splitAfterIdx+1);
+  if (!groupA.length||!groupB.length) return;
+
+  function mkRegion(group, id) {
+    const text = group.map(b=>b.text).join(' ');
+    const x1=Math.min(...group.map(b=>b.box[0])), y1=Math.min(...group.map(b=>b.box[1]));
+    const x2=Math.max(...group.map(b=>b.box[2])), y2=Math.max(...group.map(b=>b.box[3]));
+    return { id, text, t:r.t, box:[x1,y1,x2,y2], cx:(x1+x2)/2, cy:(y1+y2)/2,
+             rawBoxIds:group.map(b=>b.id??0), deleted:false, isNew:false, tl:'—' };
+  }
+  regions.splice(rIdx, 1, mkRegion(groupA, r.id), mkRegion(groupB, Date.now()));
+  _corrSelId[pageIdx]=null;
+  _renderCorrOverlay(pageIdx);
+  _renderCorrSidebar(pageIdx);
+  _saveCorrections(pageIdx);
+  toast('Region split.');
+}
+
+// ── Merge ─────────────────────────────────────
+function _doMerge(pageIdx, regionId) {
+  const sel = document.getElementById(`cmerge-${pageIdx}-${regionId}`);
+  if (!sel?.value) { toast('Select a region to merge with.'); return; }
+  const otherId = parseInt(sel.value);
+  const regions = _corrWork[pageIdx];
+  if (!regions) return;
+  const rA = regions.find(x=>x.id===regionId);
+  const rBIdx = regions.findIndex(x=>x.id===otherId);
+  const rB = regions[rBIdx];
+  if (!rA||!rB) return;
+  const allBoxes=[rA.box,rB.box];
+  const box=[Math.min(...allBoxes.map(b=>b[0])),Math.min(...allBoxes.map(b=>b[1])),
+             Math.max(...allBoxes.map(b=>b[2])),Math.max(...allBoxes.map(b=>b[3]))];
+  rA.text=[rA.text,rB.text].filter(Boolean).join(' ');
+  rA.box=box; rA.cx=(box[0]+box[2])/2; rA.cy=(box[1]+box[3])/2;
+  rA.rawBoxIds=[...(rA.rawBoxIds||[]),...(rB.rawBoxIds||[])];
+  regions.splice(rBIdx,1);
+  _corrSelId[pageIdx]=regionId;
+  _renderCorrOverlay(pageIdx); _renderCorrSidebar(pageIdx);
+  _saveCorrections(pageIdx); toast('Regions merged — consider re-translating this region (↺).');
+}
+
+// ── Delete ────────────────────────────────────
+function _deleteCorrRegion(pageIdx, regionId) {
+  const regions = _corrWork[pageIdx];
+  const r = regions?.find(x=>x.id===regionId);
+  if (r) r.deleted=true;
+  if (_corrSelId[pageIdx]===regionId) _corrSelId[pageIdx]=null;
+  _renderCorrOverlay(pageIdx); _renderCorrSidebar(pageIdx);
+  _saveCorrections(pageIdx);
+}
+
+// ── Reorder sidebar ───────────────────────────
+function _renderReorderSidebar(pageIdx) {
+  const sb=document.getElementById(`corr-sb-${pageIdx}`); if(!sb) return;
+  const regions=(_corrWork[pageIdx]||[]).filter(r=>!r.deleted);
+  sb.innerHTML=`
+    <div class="corr-sid-title">READING ORDER</div>
+    <div class="corr-order-hint">Use ↑↓ to set translation order</div>
+    <div class="corr-order-list">${regions.map((r,i)=>`
+      <div class="corr-order-item">
+        <span class="corr-order-num">${i+1}</span>
+        <span class="corr-order-text">${esc(r.text.slice(0,38))}${r.text.length>38?'…':''}</span>
+        <div class="corr-order-btns">
+          ${i>0?`<button onclick="_reorderReg(${pageIdx},${r.id},-1)">↑</button>`:'<span></span>'}
+          ${i<regions.length-1?`<button onclick="_reorderReg(${pageIdx},${r.id},1)">↓</button>`:'<span></span>'}
+        </div>
+      </div>`).join('')||'<div class="corr-empty-hint">No regions</div>'}
+    </div>`;
+}
+
+function _reorderReg(pageIdx, regionId, dir) {
+  const all=_corrWork[pageIdx]; if(!all) return;
+  const active=all.filter(r=>!r.deleted);
+  const ci=active.findIndex(r=>r.id===regionId);
+  const ni=ci+dir; if(ni<0||ni>=active.length) return;
+  const i1=all.findIndex(r=>r.id===active[ci].id);
+  const i2=all.findIndex(r=>r.id===active[ni].id);
+  [all[i1],all[i2]]=[all[i2],all[i1]];
+  _saveCorrections(pageIdx); _renderReorderSidebar(pageIdx); _renderCorrOverlay(pageIdx);
+}
+
+// ── Toolbar ───────────────────────────────────
+function setCorrMode(pageIdx, mode) {
+  _corrMode[pageIdx]=mode; _corrSelId[pageIdx]=null;
+  _updateToolbar(pageIdx); _renderCorrOverlay(pageIdx); _renderCorrSidebar(pageIdx);
+}
+
+function _updateToolbar(pageIdx) {
+  const tb=document.getElementById(`corr-tb-${pageIdx}`); if(!tb) return;
+  const mode=_corrMode[pageIdx]||'select';
+  const map={select:'SELECT',draw:'DRAW','vision-draw':'VISION',delete:'DELETE',reorder:'ORDER'};
+  tb.querySelectorAll('.corr-tool').forEach(btn=>{
+    btn.classList.toggle('active', btn.textContent.trim().startsWith(map[mode]));
+  });
+  // Disable Vision button if no Gemini key is configured
+  const vBtn = document.getElementById(`tb-vision-${pageIdx}`);
+  if (vBtn) {
+    const hasKey = !!(document.getElementById('ai-key')?.value?.trim());
+    vBtn.disabled = !hasKey;
+    vBtn.title = hasKey
+      ? 'Draw a region and re-OCR it with Gemini Vision — replaces overlapping badge text'
+      : 'Gemini API key required for Vision Draw';
+  }
+}
+
+// ── Re-translate ──────────────────────────────
+// ── Single-region retranslation with page context ────────────────────────────
+// Sends ONE bubble to the AI but includes the rest of the page's already-
+// translated regions as context so pronouns, names, and register stay consistent.
+//
+// CATCH: if the existing translations contain errors they will feed back as context.
+// Recommended workflow: fix global/systemic errors with full-page ↺ RE-TRANSLATE
+// first, then use the per-bubble ↺ to fine-tune individual regions.
+
+async function translateSingleWithContext(region, contextRegions, sourceLang, targetLang) {
+  const key     = document.getElementById('ai-key').value.trim();
+  const info    = getModelInfo();
+  const modelId = getModelId();
+  if (!key) throw new Error(`${info.label} API key not set.`);
+
+  // Build context from nearby already-translated, non-deleted regions.
+  // Using the 8 closest neighbours by vertical position (cy) rather than the
+  // full page keeps the context payload tight while still covering every bubble
+  // in the same panel or the panels immediately above/below.
+  // Exclude em-dash '—' (never translated) and hyphen '-' (AI noise-skip)
+  // so those stubs don't teach the model that '-' is a valid translation style.
+  const ctxLines = contextRegions
+    .filter(r => r.tl && r.tl !== '—' && r.tl !== '-' && r.id !== region.id)
+    .sort((a, b) => Math.abs(a.cy - region.cy) - Math.abs(b.cy - region.cy))
+    .slice(0, 8)                                     // nearest 8 neighbours
+    .sort((a, b) => a.cy - b.cy || a.cx - b.cx)     // restore reading order
+    .map(r => `[${r.t ?? 'speech'}] ${r.text} → ${r.tl}`)
+    .join('\n');
+
+  const userMsg = (ctxLines
+    ? `PAGE CONTEXT (already translated — use for consistency in names, pronouns, register):\n${ctxLines}\n\n`
+    : '') +
+    `RETRANSLATE THIS REGION:\n${JSON.stringify({ text: region.text, cx: region.cx, cy: region.cy })}`;
+
+  const res = await fetch('/translate', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      provider:    info.provider,
+      key,
+      source_lang: sourceLang,
+      payload: {
+        model:       modelId,
+        temperature: 0.3,
+        max_tokens:  800,
+        ...(info.provider === 'deepseek' ? { response_format: { type: 'json_object' } } : {}),
+        messages: [
+          {
+            role: 'system',
+            content:
+              `You are a manga translation expert. Re-translate ONE text region from ` +
+              `${getLangName(sourceLang)} to ${targetLang}.\n` +
+              `Use the page context to keep character names, pronouns, and speech register consistent.\n` +
+              `Classify the text type: speech | thought | sfx | narration | sign.\n\n` +
+              `SFX RULE: If the text is a sound effect or onomatopoeia — even if it is in a different ` +
+              `script (e.g. Japanese kana in a Vietnamese chapter) — translate or adapt it as a brief ` +
+              `English sound effect wrapped in asterisks (e.g. *CRASH*, *Sigh*, *Rumble*, *Screaming*). ` +
+              `Do NOT skip it.\n` +
+              `IMPORTANT: NEVER return "-" as the translation. Always provide your best-effort ` +
+              `translation. If the text is ambiguous, romanise it or describe it (e.g. *aaah*, ` +
+              `*laughter*). A "-" response is never acceptable here.\n` +
+              `Return ONLY a JSON object: {"tl":"translated text","t":"type"}\n` +
+              `No markdown fences, no explanation, no extra keys.`,
+          },
+          { role: 'user', content: userMsg },
+        ],
+      },
+    }),
+  });
+
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err?.error?.message || `${info.label} error ${res.status}`);
+  }
+
+  const data  = await res.json();
+  const raw   = data.choices?.[0]?.message?.content ?? '';
+  const clean = raw.replace(/```(?:json)?\n?/g, '').replace(/```/g, '').trim();
+  try {
+    const parsed = JSON.parse(clean);
+    return {
+      tl: String(parsed.tl ?? parsed.text ?? '—'),
+      t:  VALID_TEXT_TYPES.has(parsed.t) ? parsed.t : 'speech',
+    };
+  } catch { return { tl: '—', t: 'speech' }; }
+}
+
+async function retranslateRegion(pageIdx, id) {
+  const btn = document.getElementById(`crr-${pageIdx}-${id}`);
+  if (btn) { btn.disabled = true; btn.textContent = '…'; }
+  const pd = _pageStore.get(_corrStoreKey(pageIdx));
+  if (!pd) {
+    toast('No page data.');
+    if (btn) { btn.disabled = false; btn.textContent = '↺'; }
+    return;
+  }
+  const regions = (_corrWork[pageIdx] || []).filter(r => !r.deleted);
+  const target  = regions.find(r => r.id === id);
+  if (!target) { if (btn) { btn.disabled = false; btn.textContent = '↺'; } return; }
+  try {
+    const result = await translateSingleWithContext(target, regions, pd.sourceLang, getTargetLang());
+    target.tl = result.tl;
+    target.t  = result.t;
+    _saveCorrections(pageIdx);
+    // Re-render sidebar AND overlay — the type may have changed (e.g. speech→sfx),
+    // so the badge colour on the image needs to update too.
+    _renderCorrSidebar(pageIdx);
+    _renderCorrOverlay(pageIdx);
+    toast('Region re-translated.');
+  } catch (e) { toast(`Translation failed: ${e.message}`); }
+  if (btn) { btn.disabled = false; btn.textContent = '↺'; }
+}
+
+async function retranslatePage(pageIdx) {
+  const btn=document.getElementById(`corr-retrans-${pageIdx}`);
+  if(btn){btn.disabled=true; btn.textContent='Translating…';}
+  const pd=_pageStore.get(_corrStoreKey(pageIdx));
+  if(!pd){toast('No page data.');if(btn){btn.disabled=false;btn.textContent='↺ RE-TRANSLATE';} return;}
+  const targetLang=getTargetLang();
+  const working=(_corrWork[pageIdx]||[]).filter(r=>!r.deleted&&r.text.trim());
+  if(!working.length){toast('No regions to translate.');if(btn){btn.disabled=false;btn.textContent='↺ RE-TRANSLATE';} return;}
+  try {
+    const ocrLike=working.map(r=>({text:r.text,cx:r.cx,cy:r.cy}));
+    const translated=await translateBatch(ocrLike,pd.sourceLang,targetLang);
+    working.forEach((r,j)=>{ r.tl=translated[j]?.tl||'—'; r.t=translated[j]?.t||r.t; });
+    _saveCorrections(pageIdx);
+    const sid=_corrSelId[pageIdx]; if(sid!=null) _renderCorrSidebar(pageIdx);
+    toast('Page re-translated.');
+  } catch(e){ toast(`Translation failed: ${e.message}`); }
+  if(btn){btn.disabled=false; btn.textContent='↺ RE-TRANSLATE';}
+}
+
+</script>
+</body>
+</html>
+
+"""
+MANGADEX_API  = "https://api.mangadex.org"
+MANGADEX_AUTH = "https://auth.mangadex.org/realms/mangadex/protocol/openid-connect/token"
+DEEPSEEK_API  = "https://api.deepseek.com/v1/chat/completions"
+GEMINI_API    = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+
+# FIX #15 — MangaDex's API etiquette asks clients to identify themselves with
+#   a descriptive User-Agent (ideally including contact info) so they can
+#   reach out if a particular client instance misbehaves. Every request in
+#   this script previously sent the same generic "MangaTL-Reader/1.0" string,
+#   indistinguishable across every user running the tool. Centralise it here
+#   as one constant — append your own contact info if redistributing this.
+USER_AGENT = "MangaTL-Reader/1.0 (local single-user tool; run via python script)"
+
+# ── Allowlisted image-CDN hosts ───────────────────────────────────────────────
+# /proxy, /ocr-crop and /vision-crop previously accepted ANY "https://" URL.
+# That's fine while HOST stays 127.0.0.1 (only the local user can reach the
+# server at all), but it's an open HTTPS fetch/SSRF primitive with no defense
+# in depth if someone ever changes HOST to 0.0.0.0 or exposes the port via a
+# tunnel. These three routes only ever need to fetch MangaDex CDN images, so
+# restrict them to known CDN hostnames rather than trusting "starts with
+# https://" alone.
+_ALLOWED_IMAGE_HOSTS = {
+    "uploads.mangadex.org",
+}
+
+
+def _is_allowed_image_host(hostname: str) -> bool:
+    """True if hostname is an allowlisted MangaDex CDN host, or a MangaDex
+    MD@Home node (these are dynamically assigned, e.g. <hash>.mangadex.network,
+    so we match the parent domain rather than a fixed list of node names)."""
+    if not hostname:
+        return False
+    hostname = hostname.lower()
+    if hostname in _ALLOWED_IMAGE_HOSTS:
+        return True
+    return hostname.endswith(".mangadex.network") or hostname.endswith(".mangadex.org")
+
+
+def _validate_image_url(url: str):
+    """Parse + validate an image URL. Returns the parsed urllib result on
+    success; calls abort(400, ...) and does not return on failure."""
+    from urllib.parse import urlparse
+    if not url.startswith("https://"):
+        abort(400, "Only HTTPS image URLs are accepted.")
+    parsed = urlparse(url)
+    if not _is_allowed_image_host(parsed.hostname or ""):
+        abort(400, "URL host is not an allowed MangaDex CDN host.")
+    return parsed
+
+# Languages routed through Gemini Vision when vision_mode='smart'.
+# Organised by the reason EasyOCR struggles:
+#
+#   Complex / vertical scripts  (EasyOCR wasn't built for these)
+#     ja, zh, zh-hk, ko, ar, th
+#
+#   Cyrillic scripts  (sparse training data for manga fonts)
+#     ru (Russian), uk (Ukrainian), bg (Bulgarian)
+#
+#   Latin with heavy diacritics  (stylised manga fonts break EasyOCR's
+#   confidence scores on stacked / uncommon diacritic combinations)
+#     vi  — stacked tone + vowel marks (ầ, ướ, ặ…)
+#     pl  — ą ę ź ż ś ć ń
+#     cs  — á č ď ě ř š ť ů ž
+#     sk  — ľ ĺ ŕ ô dz dž
+#     hr  — š đ č ž ć
+#     ro  — ș ț ă â î  (cedilla variants frequently confused)
+#     hu  — double-acute ő ű misread as ö ü
+#     lt  — ą č ę ė į š ų ū ž
+#     lv  — ā ē ģ ī ķ ļ ņ ū ž
+#
+# Intentionally left to EasyOCR (handles them fine):
+#   en, es, fr, it, pt, pt-br, nl, de, sv, da, fi, no, id, ms, tr
+#
+# vision_mode='all' bypasses this set entirely.
+VISION_LANGS = {
+    # Complex / vertical scripts
+    'ja', 'zh', 'zh-hk', 'ko', 'ar', 'th',
+    # Cyrillic
+    'ru', 'uk', 'bg',
+    # Latin with heavy diacritics
+    'vi', 'pl', 'cs', 'sk', 'hr', 'ro', 'hu', 'lt', 'lv',
+}
+
+app = Flask(__name__)
+
+# ─── MangaDex language code → EasyOCR language list ──────────────────────────
+_LANG_MAP = {
+    'vi':    ['vi'],      'it':    ['it'],      'pt':    ['pt'],
+    'pt-br': ['pt'],      'ru':    ['ru'],      'fr':    ['fr'],
+    'es':    ['es'],      'de':    ['de'],      'pl':    ['pl'],
+    'nl':    ['nl'],      'tr':    ['tr'],      'id':    ['id'],
+    'ko':    ['ko'],      'ja':    ['ja'],      'zh':    ['ch_sim'],
+    'zh-hk': ['ch_tra'],  'th':    ['th'],      'ar':    ['ar'],
+    'uk':    ['uk'],      'cs':    ['cs'],      'hu':    ['hu'],
+    'ro':    ['ro'],      'sv':    ['sv'],      'da':    ['da'],
+    'fi':    ['fi'],      'no':    ['no'],      'ms':    ['ms'],
+    'hr':    ['hr'],      'sk':    ['sk'],      'bg':    ['bg'],
+    'lt':    ['lt'],      'lv':    ['lv'],      'en':    ['en'],
+}
+
+def _easyocr_langs(chapter_lang: str) -> list:
+    primary = _LANG_MAP.get(chapter_lang.lower(), ['en'])
+    # Always add English as secondary so SFX / onomatopoeia get picked up
+    if primary != ['en']:
+        return primary + ['en']
+    return primary
+
+
+# ─── Per-language OCR confidence thresholds ───────────────────────────────────
+# Languages with complex diacritics (Vietnamese) tend to produce more false
+# positives at low confidence, while dense-script languages (Korean hangul)
+# can score lower on genuine text.
+_MIN_CONF_MAP = {
+    'vi':    0.40,   # tonal diacritics inflate false positives
+    'ko':    0.30,   # dense hangul blocks can score lower but still be correct
+    'zh':    0.35,
+    'zh-hk': 0.35,
+    'th':    0.38,   # Thai vowel marks cause similar issues to Vietnamese
+    'ar':    0.38,
+}
+
+# ─── Language-specific translation hints ──────────────────────────────────────
+# Appended to the DeepSeek system prompt so the model understands
+# cultural/linguistic quirks of each source language.
+_LANG_HINTS = {
+    'vi':    "Vietnamese comics use honorifics like 'anh/em/chị/bạn' to signal relationships and age hierarchy — preserve these dynamics in the English translation rather than flattening everyone to 'you'.",
+    'ko':    "Korean webtoons use distinct speech levels (합쇼체 formal / 해요체 polite / 반말 casual). Reflect the character's social register in the English tone — formal characters should sound formal, casual characters casual.",
+    'zh':    "Chinese manga may include chengyu (four-character idioms) and cultural references. Translate idioms by meaning rather than literally; add brief inline context only if the meaning would otherwise be lost.",
+    'zh-hk': "This is Cantonese (Traditional Chinese). Cantonese slang and particles differ significantly from Mandarin. Prioritise natural idiomatic English over a literal rendering.",
+    'id':    "Indonesian comics may use Javanese loanwords or regional slang (e.g. 'aku/gue', 'kamu/lo'). 'Gue/lo' signals casual Jakarta speech — keep dialogue informal where appropriate.",
+    'th':    "Thai comics use politeness particles (ครับ for male speakers, ค่ะ/นะ for female). Reflect the speaker's politeness level and gender in the English tone where natural.",
+    'ru':    "Russian manga often uses diminutives and expressive suffixes for names and nouns. Preserve endearment or mockery implied by diminutive forms rather than using the base name.",
+    'fr':    "French comics distinguish 'tu' (informal) and 'vous' (formal/plural). Reflect the intimacy or formality of address in the English translation.",
+    'es':    "Spanish comics may be from Spain or Latin America with regional vocabulary differences. Translate to neutral international English unless a specific dialect is obvious.",
+    'de':    "German comics use 'du' (informal) vs 'Sie' (formal). Preserve the formality level in English dialogue.",
+    'pl':    "Polish uses grammatical gender and case extensively in dialogue — pay attention to whether the speaker refers to themselves as male or female when choosing English phrasing.",
+}
+
+
+# ─── Image preprocessing ──────────────────────────────────────────────────────
+
+def _is_colored_page(arr: np.ndarray) -> bool:
+    """
+    Return True if the page contains significant color (i.e. is not pure B&W).
+
+    Checks the HSV saturation channel at 1/4 resolution for speed.
+    A B&W manga page has near-zero saturation throughout. Colored panels push
+    saturation up noticeably. Threshold: >5% of pixels with S > 20 (out of 255).
+    Conservative enough to ignore JPEG chroma noise on B&W scans.
+    """
+    h, w  = arr.shape[:2]
+    small = cv2.resize(arr, (max(32, w // 4), max(32, h // 4)),
+                       interpolation=cv2.INTER_AREA)
+    sat   = cv2.cvtColor(small, cv2.COLOR_RGB2HSV)[:, :, 1]
+    return float(np.mean(sat > 20)) > 0.05
+
+
+def _preprocess_for_ocr(arr: np.ndarray) -> np.ndarray:
+    """
+    Adaptive preprocessing: fast path for B&W pages, smart path for colored.
+
+    B&W path  — original 3-step pipeline (grayscale → CLAHE 2.0 → denoise).
+                Fast, screentone-safe, already well-tuned for classic manga.
+
+    Colored path — 7-channel selection + adaptive inversion + CLAHE 3.0 + denoise.
+                   Tries luminance gray, L* (LAB), V (HSV), S (HSV), R, G, B
+                   and picks whichever channel has the most Laplacian edge variance
+                   (= sharpest text edges) at 1/4 resolution.
+                   Then inverts if background looks dark (border-ring sample).
+                   Only triggered when _is_colored_page() returns True, so all
+                   the colored-path risks (screentone scoring, border misfire)
+                   are completely avoided on normal B&W content.
+    """
+    if not _is_colored_page(arr):
+        # ── Fast B&W path (unchanged from original) ───────────────────────────
+        gray     = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
+        clahe    = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        enhanced = clahe.apply(gray)
+        denoised = cv2.fastNlMeansDenoising(enhanced, h=10)
+        return cv2.cvtColor(denoised, cv2.COLOR_GRAY2RGB)
+
+    # ── Colored path ──────────────────────────────────────────────────────────
+    h, w = arr.shape[:2]
+
+    # 1. Generate 7 candidate single-channel representations
+    gray_lum = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
+    lab      = cv2.cvtColor(arr, cv2.COLOR_RGB2LAB)
+    gray_l   = lab[:, :, 0]
+    hsv      = cv2.cvtColor(arr, cv2.COLOR_RGB2HSV)
+    gray_v   = hsv[:, :, 2]
+    gray_s   = hsv[:, :, 1]
+    r_ch     = arr[:, :, 0].copy()
+    g_ch     = arr[:, :, 1].copy()
+    b_ch     = arr[:, :, 2].copy()
+    candidates = [gray_lum, gray_l, gray_v, gray_s, r_ch, g_ch, b_ch]
+
+    # 2. Score each by Laplacian edge variance at 1/4 resolution (~1 ms)
+    sh, sw = max(64, h // 4), max(64, w // 4)
+    def _score(img):
+        return float(cv2.Laplacian(
+            cv2.resize(img, (sw, sh), interpolation=cv2.INTER_AREA),
+            cv2.CV_64F).var())
+    best = max(candidates, key=_score)
+
+    # 3. Adaptive inversion — sample border ring to estimate background
+    bw, bh = max(4, w // 20), max(4, h // 20)
+    border = np.concatenate([best[:bh,:].ravel(), best[-bh:,:].ravel(),
+                             best[:,:bw].ravel(), best[:,-bw:].ravel()])
+    if float(np.median(border)) < 127 or float(np.median(best)) < 90:
+        best = cv2.bitwise_not(best)
+
+    # 4. CLAHE + denoise
+    enhanced = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8)).apply(best)
+    denoised = cv2.fastNlMeansDenoising(enhanced, h=10)
+    return cv2.cvtColor(denoised, cv2.COLOR_GRAY2RGB)
+
+
+# ─── OCR engine — lazy-loaded, per-key events prevent blocking on download ────
+#
+#  FIX #3: the old code held _reader_lock for the entire model download
+#  (potentially minutes).  Now we use a per-key threading.Event so that
+#  concurrent requests for the same language wait without blocking other langs.
+#
+_readers       = {}   # tuple(langs) → EasyOCR reader (once loaded)
+_reader_events = {}   # tuple(langs) → threading.Event (set when load complete/failed)
+_reader_lock   = threading.Lock()
+_infer_lock    = threading.Lock()   # serialises PyTorch inference (not thread-safe)
+
+def _get_reader(chapter_lang: str):
+    import easyocr                # lazy — no import cost at startup
+    langs = _easyocr_langs(chapter_lang)
+    key   = tuple(langs)
+
+    # Fast path + loader/waiter decision in a single critical section.
+    # Merging the two avoids a race window where a concurrent thread could
+    # finish loading between the fast-path check and the loader decision,
+    # causing a second (redundant) model download.
+    with _reader_lock:
+        if key in _readers:
+            return _readers[key]
+        if key not in _reader_events:
+            evt       = threading.Event()
+            _reader_events[key] = evt
+            is_loader = True
+        else:
+            evt       = _reader_events[key]
+            is_loader = False
+
+    if not is_loader:
+        # Wait until the loader thread finishes (or fails)
+        evt.wait()
+        reader = _readers.get(key)
+        if reader is None:
+            raise RuntimeError(f"OCR model {langs} failed to load — retry the page.")
+        return reader
+
+    # ── We are the loader thread ──────────────────────────────────────────────
+    try:
+        print(f"  [OCR] Loading model for {langs}  (first run may download ~100–400 MB)…")
+        reader = easyocr.Reader(langs, gpu=False, verbose=False)
+        print(f"  [OCR] {langs} ready.")
+        with _reader_lock:
+            _readers[key] = reader
+        return reader
+    except Exception:
+        # Remove the event so the next request can attempt loading again
+        with _reader_lock:
+            _reader_events.pop(key, None)
+        raise
+    finally:
+        evt.set()   # always unblock any waiters, even on failure
+
+
+# ─── Gemini Vision OCR ───────────────────────────────────────────────────────
+
+_VISION_LANG_NAMES = {
+    # CJK / complex scripts (original Vision langs)
+    'ja':    'Japanese',
+    'zh':    'Chinese (Simplified)',
+    'zh-hk': 'Chinese (Traditional / Cantonese)',
+    # Korean — EasyOCR is notoriously shaky on hangul in manga
+    'ko':    'Korean',
+    # Southeast Asian scripts
+    'vi':    'Vietnamese',
+    'th':    'Thai',
+    'id':    'Indonesian',
+    'ms':    'Malay',
+    # Arabic / right-to-left
+    'ar':    'Arabic',
+    # European languages
+    'en':    'English',
+    'fr':    'French',
+    'es':    'Spanish',
+    'de':    'German',
+    'pt':    'Portuguese',
+    'pt-br': 'Portuguese (Brazilian)',
+    'it':    'Italian',
+    'ru':    'Russian',
+    'uk':    'Ukrainian',
+    'pl':    'Polish',
+    'nl':    'Dutch',
+    'tr':    'Turkish',
+    'cs':    'Czech',
+    'hu':    'Hungarian',
+    'ro':    'Romanian',
+    'sv':    'Swedish',
+    'da':    'Danish',
+    'fi':    'Finnish',
+    'no':    'Norwegian',
+    'hr':    'Croatian',
+    'sk':    'Slovak',
+    'bg':    'Bulgarian',
+    'lt':    'Lithuanian',
+    'lv':    'Latvian',
+}
+
+def _ocr_gemini_vision(image_bytes: bytes, lang: str, key: str, model: str) -> tuple:
+    """
+    Send a manga page image to Gemini Vision and ask it to extract all text
+    regions with approximate centre positions.
+
+    Returns: (regions, fallback_reason)
+      - regions        : list of dicts matching EasyOCR output schema
+                         [{"text":"…","cx":45.2,"cy":23.1,"box":[x1%,y1%,x2%,y2%]}]
+                         Empty list on any failure.
+      - fallback_reason: None on success; otherwise one of:
+                         "quota"   — 429 rate-limit / quota exhausted
+                         "error"   — other HTTP error from Gemini API
+                         "network" — connection / timeout error
+                         "parse"   — response arrived but JSON could not be parsed
+                         "empty"   — Vision returned OK but found no text on page
+    """
+    import base64, json as _json, re as _re
+
+    lang_name = _VISION_LANG_NAMES.get(lang, 'the source language')
+
+    # ── Resize before encoding to cut image-token cost ───────────────────────
+    try:
+        _img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+        _img.thumbnail((800, 1200), Image.LANCZOS)
+        _buf = io.BytesIO()
+        _img.save(_buf, format="JPEG", quality=85)
+        image_bytes = _buf.getvalue()
+        mime = "image/jpeg"
+    except Exception:
+        mime = "image/png" if image_bytes[:4] == b'\x89PNG' else "image/jpeg"
+
+    b64 = base64.b64encode(image_bytes).decode()
+
+    # ── Vision OCR prompt ────────────────────────────────────────────────────
+    # KEY DESIGN NOTES
+    # • Do NOT use responseMimeType:"application/json" — that locks Flash-Lite
+    #   into a constrained generation mode where it outputs syntactically-valid
+    #   JSON without actually reasoning about pixel positions, producing a
+    #   hallucinated cx ≈ 97 for every item regardless of real bubble location.
+    # • Do NOT set thinkingBudget:0 — Flash-Lite with zero thinking budget
+    #   cannot perform the spatial reasoning needed to estimate cx/cy accurately.
+    #   A small positive budget (512 tokens) is enough for coordinate estimation.
+    #   For models that don't support thinking, the parameter is silently ignored.
+    # • The prompt gives explicit coordinate semantics with spatial examples so
+    #   that even a small/budget model can follow the expected output format.
+    prompt = (
+        f"You are a manga OCR engine. Carefully examine the image and extract "
+        f"ALL visible text from this manga page. The text is in {lang_name}.\n"
+        f"Many speech bubbles use VERTICAL text — read top-to-bottom, output as one string.\n\n"
+        f"Return ONLY a JSON array (no markdown fences, no explanation):\n"
+        f'[{{"text":"exact text","type":"speech|thought|sfx|narration|sign",'
+        f'"cx":<0-100>,"cy":<0-100>,'
+        f'"x1":<0-100>,"y1":<0-100>,"x2":<0-100>,"y2":<0-100>}},...]\n\n'
+        f"COORDINATE RULES — read carefully:\n"
+        f"  cx = distance from the LEFT edge of the image, as a percentage (0–100).\n"
+        f"       cx=0 → leftmost pixel.  cx=50 → image centre.  cx=100 → rightmost pixel.\n"
+        f"  cy = distance from the TOP edge of the image, as a percentage (0–100).\n"
+        f"       cy=0 → top pixel.       cy=50 → image middle.  cy=100 → bottom pixel.\n"
+        f"  x1/y1 = top-left corner of the bounding box (same 0-100 % scale).\n"
+        f"  x2/y2 = bottom-right corner of the bounding box.\n\n"
+        f"  Spatial examples:\n"
+        f"    Top-left bubble  → cx≈20, cy≈15, x1≈10,y1≈8, x2≈35,y2≈25\n"
+        f"    Top-right bubble → cx≈75, cy≈12, x1≈60,y1≈5, x2≈90,y2≈22\n"
+        f"    Centre bubble    → cx≈50, cy≈50, x1≈35,y1≈42,x2≈65,y2≈58\n"
+        f"    Bottom-left SFX  → cx≈18, cy≈85, x1≈5, y1≈80,x2≈30,y2≈92\n\n"
+        f"  IMPORTANT: cx > 90 should be RARE — only for text literally at the right border.\n"
+        f"  LOOK at where each speech bubble is in the image and estimate realistically.\n\n"
+        f"OTHER RULES:\n"
+        f"- Do NOT translate. Keep original characters exactly as printed.\n"
+        f"- One entry per speech bubble / caption box / sound effect / sign.\n"
+        f"- Skip panels with no text. Skip decorative lines and panel borders."
+    )
+
+    payload = {
+        "contents": [{
+            "role": "user",
+            "parts": [
+                {"inline_data": {"mime_type": mime, "data": b64}},
+                {"text": prompt},
+            ]
+        }],
+        "generationConfig": {
+            "temperature":     0.1,
+            "maxOutputTokens": 2048,
+            # Allow a small thinking budget so the model can reason about
+            # spatial positions. Models without thinking support ignore this.
+            "thinkingConfig":  {"thinkingBudget": 512},
+            # Do NOT set responseMimeType:"application/json" here — see note above.
+        },
+    }
+
+    url = GEMINI_API.format(model=model) + f"?key={key}"
+    try:
+        r = requests.post(
+            url, json=payload,
+            headers={"Content-Type": "application/json", "User-Agent": USER_AGENT},
+            timeout=60,
+        )
+        if not r.ok:
+            if r.status_code == 429:
+                print(
+                    f"  [Vision OCR] Rate-limited (429) — falling back to EasyOCR. "
+                    f"Free tier quota may be exhausted."
+                )
+                return [], "quota"
+            else:
+                print(f"  [Vision OCR] Gemini error {r.status_code}: {r.text[:200]}")
+                return [], "error"
+        gemini_resp = r.json()
+        cand  = (gemini_resp.get("candidates") or [{}])[0]
+        parts = cand.get("content", {}).get("parts", [])
+        text = ""
+        for part in parts:
+            if not part.get("thought", False):
+                candidate = part.get("text", "")
+                if candidate.strip():
+                    text = candidate
+                    break
+        if not text and parts:
+            text = parts[0].get("text", "")
+        clean = text.replace("```json", "").replace("```", "").strip()
+        match = _re.search(r"\[[\s\S]*\]", clean)
+        if not match:
+            return [], "parse"
+        items = _json.loads(match.group(0))
+        out = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            t  = str(item.get("text", "")).strip()
+            cx = float(item.get("cx", 50))
+            cy = float(item.get("cy", 50))
+            if not t:
+                continue
+            x1 = item.get("x1")
+            y1 = item.get("y1")
+            x2 = item.get("x2")
+            y2 = item.get("y2")
+            if None not in (x1, y1, x2, y2):
+                try:
+                    box = [float(x1), float(y1), float(x2), float(y2)]
+                except (TypeError, ValueError):
+                    box = None   # sentinel — compute from cx/cy after normalization
+            else:
+                box = None       # sentinel — compute from cx/cy after normalization
+            out.append({"text": t, "cx": cx, "cy": cy, "box": box,
+                        # Capture model-supplied type hint (new prompt asks for it)
+                        "vision_type": str(item.get("type", "")).lower().strip()})
+
+        # ── Normalize 0-1 → 0-100 if model returned fractional coords ────────
+        # Flash-Lite (and occasionally Flash) return coords in two bad formats:
+        #
+        #  A) ALL fractional  — every cx/cy is 0–1    (max_coord < 2.0)
+        #                       Fix: multiply entire batch by 100.
+        #
+        #  B) MIXED           — most values are 0–1 fractions but one or two
+        #                       items (e.g. a page-credit sign near an edge)
+        #                       are already 0–100 percentages.  A single large
+        #                       outlier makes max_coord >> 2, so the all-or-
+        #                       nothing guard in Case A never fires, leaving
+        #                       all other badges stuck at <2 % — invisible.
+        #
+        #                       Detection: if ANY value >= 5 (unambiguously a
+        #                       percentage) AND ANY value < 2 (unambiguously a
+        #                       fraction) coexist in the same batch, it is
+        #                       definitively mixed regardless of batch size.
+        #                       Fix: rescale only the sub-2 values by × 100.
+        #
+        # Real manga text is never at the very image edge, so:
+        #   • a legitimate 2 % coordinate essentially never occurs in practice
+        #   • anything < 2 when something else is > 5 is always a stray fraction
+        if out:
+            # Debug: dump raw model coords before any normalization/fallback
+            # so we can tell from server logs whether cx, cy, or both are
+            # being hallucinated by Flash-Lite.
+            print("  [Vision OCR] raw coords: " +
+                  ", ".join(f"({o['cx']:.1f},{o['cy']:.1f})" for o in out))
+
+            all_vals  = [v for o in out for v in (o["cx"], o["cy"])]
+            max_coord = max(all_vals)
+
+            has_large = any(v >= 5.0 for v in all_vals)   # clearly percentage
+            has_small = any(v <  2.0 for v in all_vals)   # clearly fractional
+
+            if max_coord < 2.0:
+                # Case A — all fractional
+                print(f"  [Vision OCR] All-fractional coords (max={max_coord:.3f}) — rescaling to 0-100")
+                for o in out:
+                    o["cx"]  = round(o["cx"]  * 100, 1)
+                    o["cy"]  = round(o["cy"]  * 100, 1)
+                    if o["box"] is not None:
+                        o["box"] = [round(v * 100, 1) for v in o["box"]]
+            elif has_large and has_small:
+                # Case B — mixed format, fix per-item stragglers
+                stragglers = [o for o in out if o["cx"] < 2.0 or o["cy"] < 2.0]
+                print(f"  [Vision OCR] Mixed-format coords (max={max_coord:.1f}) "
+                      f"— rescaling {len(stragglers)} straggler(s) to 0-100")
+                for o in stragglers:
+                    if o["cx"] < 2.0:
+                        o["cx"] = round(o["cx"] * 100, 1)
+                    if o["cy"] < 2.0:
+                        o["cy"] = round(o["cy"] * 100, 1)
+                    if o["box"] is not None:
+                        o["box"] = [round(v * 100, 1) if v < 2.0 else round(v, 1)
+                                    for v in o["box"]]
+
+            # Safety clamp — no badge should escape the visible image area
+            for o in out:
+                o["cx"] = max(1.0, min(99.0, o["cx"]))
+                o["cy"] = max(1.0, min(99.0, o["cy"]))
+                if o["box"] is not None:
+                    o["box"] = [max(0.0, min(100.0, v)) for v in o["box"]]
+
+            # ── Extreme-cluster fallback ─────────────────────────────────────
+            # Flash-Lite with no thinking budget sometimes hallucinates cx ≈ 97
+            # for every single item regardless of actual bubble position.
+            # This is detectable: if >= 70 % of cx values are > 85 % (right
+            # edge where speech bubbles never live), the cx half of the batch
+            # is garbage.
+            #
+            # cy is hallucinated far less often than cx, so instead of
+            # throwing it away too, we KEEP the model's cy estimates — they
+            # usually still track each bubble's vertical position — and only
+            # override cx, pinning every badge into a thin LEFT-margin column
+            # so the numbered circles stay legible and line up with the
+            # bubble each one actually belongs to.
+            #
+            # Only if cy is ALSO clustered/degenerate (span < 10 %, i.e. the
+            # model dumped every item near the same point) do we fall back to
+            # spreading badges evenly down the left margin in model order —
+            # that's the old "garbage in, garbage out" behaviour, kept as a
+            # last resort.
+            if len(out) >= 2:
+                cx_vals    = [o["cx"] for o in out]
+                right_frac = sum(1 for v in cx_vals if v > 85) / len(cx_vals)
+                if right_frac >= 0.70:
+                    n       = len(out)
+                    cy_vals = [o["cy"] for o in out]
+                    cy_span = max(cy_vals) - min(cy_vals)
+
+                    if cy_span >= 10.0:
+                        print(
+                            f"  [Vision OCR] Extreme right-cluster ({right_frac:.0%} have cx>85) "
+                            f"— cy spread looks usable (span={cy_span:.1f}%), "
+                            f"keeping model cy, moving {n} badge(s) to left margin"
+                        )
+                        for o in out:
+                            o["cx"] = 8.0
+                            o["box"] = [3.0, max(1.0, o["cy"] - 3.5),
+                                        13.0, min(99.0, o["cy"] + 3.5)]
+                    else:
+                        step = 90.0 / max(n - 1, 1)
+                        print(
+                            f"  [Vision OCR] Extreme right-cluster ({right_frac:.0%} have cx>85) "
+                            f"AND cy is also clustered (span={cy_span:.1f}%) "
+                            f"— redistributing {n} badge(s) evenly down left margin"
+                        )
+                        for i, o in enumerate(out):
+                            o["cx"] = 8.0
+                            o["cy"] = round(5.0 + i * step, 1)
+                            o["box"] = [3.0, o["cy"] - 3.5, 13.0, o["cy"] + 3.5]
+
+        # ── Fill fallback boxes from the now-normalised cx/cy ─────────────────
+        # Done AFTER normalisation so the ±8/±5 offsets are in the 0-100 %
+        # space regardless of whether the model used fractions or percentages.
+        for o in out:
+            if o["box"] is None:
+                o["box"] = [o["cx"] - 8.0, o["cy"] - 5.0,
+                            o["cx"] + 8.0, o["cy"] + 5.0]
+
+        if not out:
+            return [], "empty"
+        return out, None
+
+    except requests.exceptions.ConnectionError:
+        print(f"  [Vision OCR] Network error — falling back to EasyOCR")
+        return [], "network"
+    except requests.exceptions.Timeout:
+        print(f"  [Vision OCR] Timeout — falling back to EasyOCR")
+        return [], "network"
+    except Exception as e:
+        print(f"  [Vision OCR] failed: {e}")
+        return [], "error"
+
+
+# ─── Panel border detection ───────────────────────────────────────────────────
+
+def _find_panel_borders(gray: np.ndarray, img_w: int, img_h: int):
+    """
+    Detect horizontal and vertical panel border lines in a manga page.
+
+    Strategy: morphological OPEN with a long thin kernel.  A feature only
+    survives the OPEN if it spans at least 40 % of the image dimension, which
+    reliably captures panel borders while ignoring speech bubble outlines,
+    character art, and screentone patterns.
+
+    Returns:
+        h_borders — sorted list of y-coordinates (pixel) of horizontal borders
+        v_borders — sorted list of x-coordinates (pixel) of vertical borders
+    """
+    _, binary = cv2.threshold(gray, 50, 255, cv2.THRESH_BINARY_INV)
+
+    # ── Horizontal borders ────────────────────────────────────────────────────
+    min_h_span = max(1, int(img_w * 0.40))
+    h_kernel   = cv2.getStructuringElement(cv2.MORPH_RECT, (min_h_span, 1))
+    h_img      = cv2.morphologyEx(binary, cv2.MORPH_OPEN, h_kernel)
+
+    # ── Vertical borders ──────────────────────────────────────────────────────
+    min_v_span = max(1, int(img_h * 0.40))
+    v_kernel   = cv2.getStructuringElement(cv2.MORPH_RECT, (1, min_v_span))
+    v_img      = cv2.morphologyEx(binary, cv2.MORPH_OPEN, v_kernel)
+
+    def _cluster(indices, gap: int = 6) -> list:
+        """Collapse a run of consecutive pixel indices into a single midpoint."""
+        if not len(indices):
+            return []
+        borders, run_start, prev = [], int(indices[0]), int(indices[0])
+        for idx in indices[1:]:
+            idx = int(idx)
+            if idx - prev > gap:
+                borders.append((run_start + prev) // 2)
+                run_start = idx
+            prev = idx
+        borders.append((run_start + prev) // 2)
+        return borders
+
+    h_rows = np.where(np.any(h_img > 0, axis=1))[0]
+    v_cols = np.where(np.any(v_img > 0, axis=0))[0]
+
+    return _cluster(h_rows), _cluster(v_cols)
+
+
+def _crosses_border(
+    box_a: tuple, box_b: tuple,
+    h_borders: list, v_borders: list,
+) -> bool:
+    """
+    Return True if a direct path from box_a to box_b must cross a panel border.
+
+    We check whether any detected border line falls strictly inside the gap
+    between the two boxes — not inside either box itself.
+    """
+    ax1, ay1, ax2, ay2 = box_a
+    bx1, by1, bx2, by2 = box_b
+
+    # Vertical gap (potential horizontal border between them)
+    gap_top    = min(ay2, by2)   # bottom of the higher box
+    gap_bottom = max(ay1, by1)   # top  of the lower  box
+    if gap_bottom > gap_top:
+        for y in h_borders:
+            if gap_top < y < gap_bottom:
+                return True
+
+    # Horizontal gap (potential vertical border between them)
+    gap_left  = min(ax2, bx2)   # right edge of the left  box
+    gap_right = max(ax1, bx1)   # left  edge of the right box
+    if gap_right > gap_left:
+        for x in v_borders:
+            if gap_left < x < gap_right:
+                return True
+
+    return False
+
+
+# ─── Bubble region merging ────────────────────────────────────────────────────
+
+def _merge_bubble_regions(
+    boxes,
+    img_w: int,
+    img_h: int,
+    h_borders:    list | None  = None,
+    v_borders:    list | None  = None,
+    margin_scale: float        = 0.5,
+    confidences:  list | None  = None,
+    min_conf:     float | None = None,
+    clustered_floor: float     = 0.0,
+):
+    """
+    Group OCR bounding boxes that belong to the same speech bubble, then merge
+    each group into a single region with combined text.
+
+    Algorithm:
+      1. Expand every box by MERGE_MARGIN pixels on all sides.
+      2. Any two expanded boxes that overlap → same bubble (union-find),
+         UNLESS a panel border line falls in the gap between them.
+      3. If confidences/min_conf were supplied, drop low-confidence boxes
+         UNLESS they share a group with at least one confident box (see
+         "Confidence-aware filtering" below) — otherwise keep everything
+         (caller is responsible for pre-filtering, as before).
+      4. Within each group sort fragments top-to-bottom then left-to-right
+         (natural reading order inside the bubble) and join their text.
+      5. Return one {text, cx, cy} per group, centred on the merged bounding box.
+
+    Confidence-aware filtering (confidences / min_conf / clustered_floor):
+      `confidences` is a list PARALLEL to `boxes` (confidences[i] is boxes[i]'s
+      recognition confidence), not embedded in the box tuple itself — this is
+      deliberate. Extending the 5-element box tuple to 6 elements would silently
+      break any existing `x1, y1, x2, y2, text = box`-style unpacking elsewhere
+      in this function (there's one such line) or anywhere a caller does the
+      same; a parallel list sidesteps that entirely since every other access
+      pattern in this function already reads boxes[i][idx], which tolerates
+      unrelated data living alongside it in a separate list just fine.
+
+      When both `confidences` and `min_conf` are given, a box normally needs
+      confidences[i] >= min_conf to survive — UNLESS it shares a merge group
+      with at least one box that clears min_conf on its own, in which case
+      confidences[i] >= clustered_floor is enough. Rationale: a low-confidence
+      fragment adjacent to (and merging with) confident neighbours in the same
+      bubble is much more likely to be real, correctly-recognised text that
+      merely scored low (seen in practice with stylised mixed-case manga
+      fonts) than an isolated low-confidence fragment with no such support,
+      which is more likely genuine noise. clustered_floor still guards against
+      pure noise happening to fall inside a real bubble's expanded margin.
+
+      If `confidences` is None (the default), no confidence filtering happens
+      here at all — behaves exactly as before for any caller that doesn't
+      pass it.
+
+    MERGE_MARGIN is content-adaptive and computed PER-BOX, not page-wide:
+      margin(i) = height(box i) x margin_scale
+
+      Each box is expanded using its OWN height, not a single page-wide
+      median. Two boxes are candidates to merge if their expanded rects
+      overlap — which succeeds if EITHER box's own margin is enough to
+      bridge the gap, so a box only needs to "reach" as far as its own
+      text size implies is reasonable for its own line spacing.
+
+      This fixes a real bug in the old page-wide-median approach: a page
+      mixing small incidental text (SFX, panel labels — low height) with
+      one or more large, wide-line-spacing bubbles would compute a small
+      global margin from the page's small-text median, which was then far
+      too small to bridge the large bubble's own (proportionally larger)
+      line gaps — silently splitting one bubble's sentence into multiple
+      disconnected regions with no error or warning anywhere downstream.
+      Per-box margins mean a bubble's own line height governs whether its
+      own lines merge, independent of what else is on the page.
+
+      margin_scale (default 0.5) is the user-tunable sensitivity knob.
+
+      Webtoon strips (img_h / img_w > 2) use 60 % of the normal scale to
+      avoid bridging vertically-stacked panels on tall narrow canvases.
+
+      A small absolute floor still applies (4px) so degenerate zero/near-zero
+      height boxes (stray noise) don't get an unreasonably tiny margin.
+
+      Line-height note: the gap BETWEEN two lines of text ("leading") is
+      typically wider than either line's own glyph height — measured
+      against real EasyOCR output on manga-style multi-line bubbles, gaps
+      of ~1.5x the box height are normal, not an outlier. A margin of
+      0.5x each box's height (i.e. 1.0x combined between two adjacent
+      boxes) was found to still be too small to bridge genuine same-bubble
+      line gaps, so the per-box margin is scaled by a LINE_GAP_FACTOR on
+      top of margin_scale — margin_scale remains the user-facing slider
+      (unchanged range/meaning), LINE_GAP_FACTOR is the calibration
+      constant that makes the default (1.0) actually bridge normal
+      same-bubble line spacing.
+
+    Panel border guard (h_borders / v_borders):
+      Even if two expanded boxes overlap, they will NOT be merged if a detected
+      panel border line lies in the gap between them.  This prevents speech
+      bubbles from adjacent panels being collapsed into one region, which is the
+      most common cause of incoherent translations.
+    """
+    if not boxes:
+        return [], []
+
+    h_borders = h_borders or []
+    v_borders = v_borders or []
+
+    # Calibration constant — NOT the user-facing slider. Chosen so that two
+    # adjacent same-bubble lines (combined margin = 2 x own_margin) reliably
+    # bridge a ~1.5x-box-height gap, which real EasyOCR output on manga-style
+    # bubbles showed is normal line spacing, not an outlier.
+    LINE_GAP_FACTOR = 1.6
+
+    is_webtoon = (img_h / max(img_w, 1)) > 2.0
+    eff_scale  = margin_scale * LINE_GAP_FACTOR * (0.6 if is_webtoon else 1.0)
+
+    # Per-box margin: each box reaches only as far as its OWN height implies,
+    # rather than every box on the page sharing one page-wide median-derived
+    # value. See docstring above for why this matters.
+    margins = [max(4, int((boxes[i][3] - boxes[i][1]) * eff_scale))
+               for i in range(len(boxes))]
+
+    # ── Union-Find ────────────────────────────────────────────────────────────
+    n      = len(boxes)
+    parent = list(range(n))
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x         = parent[x]
+        return x
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[ra] = rb
+
+    def expanded(i):
+        x1, y1, x2, y2, _ = boxes[i]
+        m = margins[i]
+        return (x1 - m, y1 - m, x2 + m, y2 + m)
+
+    def overlaps(a, b):
+        ax1, ay1, ax2, ay2 = a
+        bx1, by1, bx2, by2 = b
+        return ax1 <= bx2 and bx1 <= ax2 and ay1 <= by2 and by1 <= ay2
+
+    exp = [expanded(i) for i in range(n)]
+    for i in range(n):
+        for j in range(i + 1, n):
+            if overlaps(exp[i], exp[j]):
+                # Even if expanded boxes overlap, refuse to merge them if a
+                # panel border separates the original (un-expanded) boxes.
+                if not _crosses_border(boxes[i][:4], boxes[j][:4],
+                                       h_borders, v_borders):
+                    union(i, j)
+
+    # ── Group by root ─────────────────────────────────────────────────────────
+    groups: dict = {}
+    for i in range(n):
+        groups.setdefault(find(i), []).append(i)
+
+    # ── Confidence-aware filtering (only if the caller opted in) ───────────────
+    # See docstring "Confidence-aware filtering" section for the full rationale.
+    if confidences is not None and min_conf is not None:
+        filtered_groups: dict = {}
+        for root, indices in groups.items():
+            has_confident_member = any(confidences[i] >= min_conf for i in indices)
+            floor = clustered_floor if has_confident_member else min_conf
+            kept = [i for i in indices if confidences[i] >= floor]
+            if kept:
+                filtered_groups[root] = kept
+        groups = filtered_groups
+
+    # ── Merge each group ──────────────────────────────────────────────────────
+    regions      = []
+    group_raw_ids = []   # parallel list: raw box indices per merged region
+    for indices in groups.values():
+        # Sort fragments into reading order by first clustering them into
+        # visual LINES (by vertical overlap), then ordering lines top-to-
+        # bottom and fragments left-to-right within each line.
+        #
+        # A naive sort by raw (y1, x1) alone is fragile: two words on the
+        # same visual line can have slightly different y1 (detection noise,
+        # or a short word's box simply not spanning the same vertical range
+        # as a taller neighbour), which can push a word out of sequence
+        # relative to where it actually reads — e.g. "un" placed after
+        # "paseo tranquilo." even though "un" comes first in the sentence,
+        # because "un"'s y1 happened to be a few px lower than its
+        # same-line neighbour's. Clustering by vertical overlap first is
+        # robust to that: two boxes are "the same line" if they share
+        # significant vertical extent, regardless of small y1 differences.
+        def _line_cluster(idxs):
+            items = sorted(idxs, key=lambda i: boxes[i][1])  # seed by top-y
+            lines: list[list[int]] = []
+            for i in items:
+                y1, y2 = boxes[i][1], boxes[i][3]
+                placed = False
+                for line in lines:
+                    # Compare against the line's current vertical extent
+                    ly1 = min(boxes[k][1] for k in line)
+                    ly2 = max(boxes[k][3] for k in line)
+                    overlap = min(y2, ly2) - max(y1, ly1)
+                    min_h   = min(y2 - y1, ly2 - ly1)
+                    if min_h > 0 and overlap / min_h > 0.4:
+                        line.append(i)
+                        placed = True
+                        break
+                if not placed:
+                    lines.append([i])
+            lines.sort(key=lambda line: min(boxes[k][1] for k in line))
+            ordered = []
+            for line in lines:
+                line.sort(key=lambda i: boxes[i][0])  # left-to-right within line
+                ordered.extend(line)
+            return ordered
+
+        indices = _line_cluster(indices)
+
+        # Re-join fragments split across lines with a trailing hyphen.
+        # e.g. ["SHUN-", "PEI."] → "SHUNPEI."
+        texts  = [boxes[i][4] for i in indices]
+        joined: list[str] = []
+        for fragment in texts:
+            if joined and joined[-1].endswith('-'):
+                joined[-1] = joined[-1][:-1] + fragment
+            else:
+                joined.append(fragment)
+        merged_text = " ".join(joined)
+        mx1 = min(boxes[i][0] for i in indices)
+        my1 = min(boxes[i][1] for i in indices)
+        mx2 = max(boxes[i][2] for i in indices)
+        my2 = max(boxes[i][3] for i in indices)
+
+        regions.append({
+            "text": merged_text,
+            "cx":   round((mx1 + mx2) / 2 / img_w * 100, 1),
+            "cy":   round((my1 + my2) / 2 / img_h * 100, 1),
+            # Percentage bounding box so the frontend can overlay correction
+            # boxes on the image without knowing the raw pixel dimensions.
+            "box":  [
+                round(mx1 / img_w * 100, 1), round(my1 / img_h * 100, 1),
+                round(mx2 / img_w * 100, 1), round(my2 / img_h * 100, 1),
+            ],
+        })
+        group_raw_ids.append(list(indices))
+
+    # Sort final regions top-to-bottom, keeping group_raw_ids in sync.
+    if regions:
+        paired = sorted(zip(regions, group_raw_ids),
+                        key=lambda p: (p[0]["cy"], p[0]["cx"]))
+        regions, group_raw_ids = map(list, zip(*paired))
+    return regions, group_raw_ids
+
+
+def _run_easyocr_detection(image_bytes: bytes, lang: str, margin_scale: float):
+    """
+    Run the full EasyOCR detection + bubble-merge pipeline on a page image.
+
+    This is the box-DETECTION half of OCR: panel-border detection, CLAHE
+    preprocessing, EasyOCR readtext, confidence filtering, and union-find
+    bubble merging. It does not care which engine eventually supplies the
+    *text* for each region — Gemini Vision results can be matched onto
+    these boxes by _match_vision_to_easyocr() below, since EasyOCR's
+    bounding boxes come from a real text-detection model and don't suffer
+    from the spatial hallucination that small LLMs like Flash-Lite do.
+
+    Returns:
+        regions       — [{text, cx, cy, box, raw_box_ids}, …] (EasyOCR's own
+                         recognised text; may be ignored by the caller)
+        raw_boxes_out — [{id, text, box, px}, …] per-fragment boxes that
+                         regions[i]['raw_box_ids'] index into
+    """
+    # 2. Decode
+    try:
+        pil  = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+        w, h = pil.size
+        arr  = np.array(pil)
+    except Exception as e:
+        abort(422, f"Image decode error: {e}")
+
+    # 2b. Detect panel borders from the ORIGINAL grayscale image.
+    #     Must be done before preprocessing because CLAHE can alter the dark
+    #     border lines and make them harder to distinguish from panel content.
+    gray_orig         = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
+    h_borders, v_borders = _find_panel_borders(gray_orig, w, h)
+
+    # 2c. Preprocess — CLAHE contrast enhancement + mild denoising.
+    #     Improves OCR accuracy significantly for text printed over patterned
+    #     or gradient backgrounds, and for languages with fine diacritics.
+    arr = _preprocess_for_ocr(arr)
+
+    # 3. OCR  (serialised — PyTorch is not thread-safe)
+    try:
+        reader = _get_reader(lang)
+        with _infer_lock:
+            raw = reader.readtext(
+                arr,
+                detail=1,
+                paragraph=False,
+                contrast_ths=0.1,    # default 0.1 — explicit for clarity
+                adjust_contrast=0.5, # auto-boost low-contrast text regions
+                text_threshold=0.6,  # slightly more permissive than default 0.7
+                min_size=10,         # ignore sub-pixel noise detections
+            )
+    except Exception as e:
+        abort(500, f"OCR failed: {e}")
+
+    # 4. Build the candidate box list. Per-language min_conf and the
+    #    short-word carve-out (below) still apply, but ordinary confidence
+    #    rejection is now DEFERRED to _merge_bubble_regions rather than
+    #    done here — see that function's "Confidence-aware filtering"
+    #    docstring section for why: a low-confidence fragment that's
+    #    spatially adjacent to (and would merge with) confident neighbours
+    #    is much more likely to be real text than an isolated one, and only
+    #    _merge_bubble_regions knows which fragments are adjacent. Filtering
+    #    here, before clustering happens, can't tell the two cases apart.
+    #
+    #    SHORT_WORD_MIN_CONF is still applied here (not deferred): it's a
+    #    separate, narrower carve-out for very short fragments (<=2
+    #    characters after stripping). Verified against real EasyOCR output:
+    #    standalone short function words that are entirely legitimate ("A"
+    #    as in Spanish/Hungarian "a/the", French "a" as in "has") scored as
+    #    low as 0.155-0.156 confidence — well below the default 0.35 floor —
+    #    and were being silently discarded, truncating the start of
+    #    otherwise-correct sentences. A short fragment is inherently harder
+    #    for the recognition model to score confidently (little surrounding
+    #    context to disambiguate), so low confidence alone isn't as strong a
+    #    noise signal for short text as it is for longer text. This one
+    #    stays a hard floor (not cluster-deferred) because a stray 1-2
+    #    character noise blob sitting near real text is a real risk the
+    #    cluster-adjacency trust signal doesn't protect against the same way
+    #    it does for longer, more distinctive fragments.
+    SHORT_WORD_MIN_CONF = 0.12
+    min_conf = _MIN_CONF_MAP.get(lang, 0.35)
+    boxes = []          # each entry: (x1, y1, x2, y2, text)
+    confidences = []    # parallel to boxes — see _merge_bubble_regions docstring
+    for bbox, text, conf in raw:
+        text = text.strip()
+        if not text:
+            continue
+        if len(text) <= 2 and conf < SHORT_WORD_MIN_CONF:
+            continue
+        # bbox: [[x1,y1],[x2,y1],[x2,y2],[x1,y2]]
+        xs = [p[0] for p in bbox]
+        ys = [p[1] for p in bbox]
+        boxes.append((min(xs), min(ys), max(xs), max(ys), text))
+        confidences.append(conf)
+
+    # 4b. Fallback retry — only when preprocessing returned literally zero boxes.
+    #     Threshold is 0, not 2, so wordless art pages (which correctly have no
+    #     text) are never double-processed.  We only retry when OCR found nothing
+    #     at all, suggesting preprocessing may have hurt rather than helped
+    #     (e.g. an unusual panel where the selected channel was counterproductive).
+    #     Uses the raw original image + EasyOCR's own max internal contrast boost.
+    if len(boxes) == 0:
+        print(f"  [OCR] Zero boxes from preprocessed image — retrying on raw "
+              f"(lang={lang})")
+        try:
+            arr_raw = np.array(pil)
+            with _infer_lock:
+                raw2 = reader.readtext(
+                    arr_raw,
+                    detail=1,
+                    paragraph=False,
+                    contrast_ths=0.05,
+                    adjust_contrast=1.0,
+                    text_threshold=0.5,
+                    min_size=8,
+                )
+            for bbox, text, conf in raw2:
+                text = text.strip()
+                if not text or conf < max(min_conf - 0.05, 0.20):
+                    continue
+                xs = [p[0] for p in bbox]
+                ys = [p[1] for p in bbox]
+                boxes.append((min(xs), min(ys), max(xs), max(ys), text))
+                confidences.append(conf)
+            if boxes:
+                print(f"  [OCR] Raw fallback recovered {len(boxes)} box(es)")
+        except Exception as e:
+            print(f"  [OCR] Raw fallback failed: {e}")
+
+    # 5. Build raw_box output (percentage + pixel coords) before merging.
+    #    The frontend stores these to support the correction UI split feature.
+    raw_boxes_out = [
+        {
+            "id":  idx,
+            "text": b[4],
+            "box": [
+                round(b[0] / w * 100, 1), round(b[1] / h * 100, 1),
+                round(b[2] / w * 100, 1), round(b[3] / h * 100, 1),
+            ],
+            "px":  [int(b[0]), int(b[1]), int(b[2]), int(b[3])],
+        }
+        for idx, b in enumerate(boxes)
+    ]
+
+    # 6. Merge nearby boxes — fragments from the same speech bubble get
+    #    clustered together using union-find on expanded bounding boxes,
+    #    with panel borders acting as hard merge barriers.
+    regions, group_raw_ids = _merge_bubble_regions(
+        boxes, w, h, h_borders, v_borders, margin_scale,
+        confidences=confidences, min_conf=min_conf, clustered_floor=SHORT_WORD_MIN_CONF,
+    )
+
+    # 7. Attach raw_box_ids so the frontend knows which raw fragments
+    #    belong to each merged region (needed for the split correction tool).
+    for region, raw_ids in zip(regions, group_raw_ids):
+        region["raw_box_ids"] = raw_ids
+
+    return regions, raw_boxes_out
+
+
+def _normalize_for_match(s: str) -> str:
+    """
+    Reduce OCR'd text to a bare lowercase alphanumeric string with no
+    diacritics, for fuzzy comparison between Gemini Vision's text and
+    EasyOCR's (often noisier) recognition of the same bubble.
+
+    e.g. "Bẩn thật!!" -> "banthat"   "CHO 90 PHÚT ĐI" -> "cho90phutdi"
+
+    Stripping diacritics matters a lot for Vietnamese: EasyOCR frequently
+    gets the base letters right but drops/garbles tone marks, while Gemini
+    Vision usually gets them right — without normalising, two transcriptions
+    of the same bubble can look unrelated even though they're the same text.
+    """
+    import unicodedata, re as _re2
+    s = unicodedata.normalize('NFKD', s or "")
+    s = ''.join(c for c in s if not unicodedata.combining(c))
+    return _re2.sub(r'[^a-z0-9]+', '', s.lower())
+
+
+def _match_vision_to_easyocr(vision_regions: list, easy_regions: list,
+                              raw_boxes_out: list, min_ratio: float = 0.45):
+    """
+    Pair each Gemini-Vision text item with the EasyOCR-detected box whose
+    recognised text is the closest fuzzy match, and adopt EasyOCR's
+    cx/cy/box for that item. Gemini's text/type/translation are left as-is —
+    only the POSITION is replaced.
+
+    Why: EasyOCR is a dedicated text-DETECTION model. Its boxes come from
+    actually finding text on the page, so they don't suffer from the
+    cx/cy hallucination that small Vision-LLMs (Flash-Lite) are prone to.
+    Gemini is generally better at reading *what* the text says (especially
+    stylised fonts, vertical text, SFX), so this keeps each engine doing
+    the part it's good at.
+
+    Matching is greedy 1:1 by best fuzzy-match ratio first (difflib on
+    diacritic-stripped text — see _normalize_for_match). Vision items with
+    no good EasyOCR match (ratio < min_ratio, or no EasyOCR boxes at all)
+    keep whatever cx/cy/box _ocr_gemini_vision already computed for them
+    (raw model coords, run through its own normalization/fallback heuristics).
+
+    `raw_boxes_out` is the EasyOCR raw-fragment list — mutated in place:
+    matched vision regions adopt the matched EasyOCR region's raw_box_ids;
+    unmatched vision regions get a synthetic raw_box entry appended so the
+    frontend's split-correction tool still has something to index into.
+
+    Returns (matched_count, total_vision_count) for logging.
+    """
+    import difflib
+
+    total = len(vision_regions)
+    if total == 0:
+        return 0, 0
+
+    if easy_regions:
+        v_norm = [_normalize_for_match(r.get("text", "")) for r in vision_regions]
+        e_norm = [_normalize_for_match(r.get("text", "")) for r in easy_regions]
+
+        # Score every plausible (vision, easyocr) pair.
+        pairs = []
+        for vi, vt in enumerate(v_norm):
+            if len(vt) < 3:
+                continue
+            for ei, et in enumerate(e_norm):
+                if len(et) < 3:
+                    continue
+                ratio = difflib.SequenceMatcher(None, vt, et).ratio()
+                if ratio >= min_ratio:
+                    pairs.append((ratio, vi, ei))
+
+        # Greedy 1:1 assignment, best matches first.
+        pairs.sort(key=lambda p: -p[0])
+        used_v, used_e = set(), set()
+        for ratio, vi, ei in pairs:
+            if vi in used_v or ei in used_e:
+                continue
+            used_v.add(vi)
+            used_e.add(ei)
+            vr, er = vision_regions[vi], easy_regions[ei]
+            print(f"  [OCR] matched Vision '{vr.get('text','')[:24]}' "
+                  f"↔ EasyOCR '{er.get('text','')[:24]}' (ratio={ratio:.2f})")
+            vr["cx"]  = er["cx"]
+            vr["cy"]  = er["cy"]
+            vr["box"] = er["box"]
+            vr["raw_box_ids"] = er.get("raw_box_ids", [])
+    else:
+        used_v = set()
+
+    # Unmatched Vision items: keep their existing (heuristic) coords, but
+    # still need a raw_box entry for the split-correction tool.
+    for vi, vr in enumerate(vision_regions):
+        if vi in used_v:
+            continue
+        new_id = len(raw_boxes_out)
+        raw_boxes_out.append({
+            "id": new_id, "text": vr.get("text", ""),
+            "box": vr.get("box", [vr["cx"] - 8, vr["cy"] - 5, vr["cx"] + 8, vr["cy"] + 5]),
+            "px": [0, 0, 0, 0],
+        })
+        vr["raw_box_ids"] = [new_id]
+
+    return len(used_v), total
+
+
+# ─── Routes ───────────────────────────────────────────────────────────────────
+
+# FIX #9 — health endpoint so the frontend can detect "proxy not running"
+@app.route("/health")
+def health():
+    return jsonify({"status": "ok"})
+
+
+# Suppress browser's automatic favicon.ico request — Flask has no static folder
+# so without this every page load logs a 404, cluttering the DevTools console.
+@app.route("/favicon.ico")
+def favicon():
+    return Response("", status=204)  # 204 No Content — browser stops asking
+
+
+@app.route("/")
+def index():
+    return Response(_HTML, content_type="text/html; charset=utf-8")
+
+
+@app.route("/mangadex/<path:api_path>")
+def mangadex_api(api_path):
+    url    = f"{MANGADEX_API}/{api_path}"
+    params = request.query_string.decode()
+    if params:
+        url = f"{url}?{params}"
+    headers = {"User-Agent": USER_AGENT}
+    # Forward auth token if the frontend provided one
+    auth = request.headers.get("Authorization", "")
+    if auth.startswith("Bearer "):
+        headers["Authorization"] = auth
+    try:
+        r = requests.get(url, timeout=15, headers=headers)
+        return Response(r.content, status=r.status_code,
+                        content_type=r.headers.get("Content-Type", "application/json"))
+    except requests.RequestException as e:
+        abort(502, f"MangaDex API error: {e}")
+
+
+# ─── MangaDex OAuth2 login / refresh ─────────────────────────────────────────
+# MangaDex uses personal clients (not the public OAuth code flow).
+# Users create one at: mangadex.org → Account Settings → API Clients
+# Then log in with: client_id + client_secret + username + password.
+
+@app.route("/auth/login", methods=["POST"])
+def auth_login():
+    """
+    POST { username, password, client_id, client_secret }
+    Returns { access_token, refresh_token, expires_in }
+    """
+    body          = request.get_json(force=True, silent=True) or {}
+    username      = body.get("username",      "").strip()
+    password      = body.get("password",      "").strip()
+    client_id     = body.get("client_id",     "").strip()
+    client_secret = body.get("client_secret", "").strip()
+
+    if not all([username, password, client_id, client_secret]):
+        abort(400, "username, password, client_id and client_secret are all required.")
+
+    try:
+        r = requests.post(
+            MANGADEX_AUTH,
+            data={
+                "grant_type":    "password",
+                "username":      username,
+                "password":      password,
+                "client_id":     client_id,
+                "client_secret": client_secret,
+            },
+            headers={"User-Agent": USER_AGENT},
+            timeout=15,
+        )
+    except requests.RequestException as e:
+        abort(502, f"MangaDex auth error: {e}")
+
+    if not r.ok:
+        return Response(r.content, status=r.status_code,
+                        content_type=r.headers.get("Content-Type", "application/json"))
+
+    d = r.json()
+    return jsonify({
+        "access_token":  d["access_token"],
+        "refresh_token": d.get("refresh_token", ""),
+        "expires_in":    d.get("expires_in", 900),
+    })
+
+
+@app.route("/auth/refresh", methods=["POST"])
+def auth_refresh():
+    """
+    POST { refresh_token, client_id, client_secret }
+    Returns { access_token, refresh_token, expires_in }
+    """
+    body          = request.get_json(force=True, silent=True) or {}
+    refresh_token = body.get("refresh_token", "").strip()
+    client_id     = body.get("client_id",     "").strip()
+    client_secret = body.get("client_secret", "").strip()
+
+    if not all([refresh_token, client_id, client_secret]):
+        abort(400, "refresh_token, client_id and client_secret are required.")
+
+    try:
+        r = requests.post(
+            MANGADEX_AUTH,
+            data={
+                "grant_type":    "refresh_token",
+                "refresh_token": refresh_token,
+                "client_id":     client_id,
+                "client_secret": client_secret,
+            },
+            headers={"User-Agent": USER_AGENT},
+            timeout=15,
+        )
+    except requests.RequestException as e:
+        abort(502, f"MangaDex token refresh error: {e}")
+
+    if not r.ok:
+        return Response(r.content, status=r.status_code,
+                        content_type=r.headers.get("Content-Type", "application/json"))
+
+    d = r.json()
+    return jsonify({
+        "access_token":  d["access_token"],
+        "refresh_token": d.get("refresh_token", ""),
+        "expires_in":    d.get("expires_in", 900),
+    })
+
+
+# FIX #12 — /proxy is now actively used by the frontend for all image display
+@app.route("/proxy")
+def proxy():
+    url = request.args.get("url", "").strip()
+    _validate_image_url(url)
+    try:
+        r = requests.get(url, timeout=20, headers={"User-Agent": USER_AGENT})
+        r.raise_for_status()
+        return Response(r.content, content_type=r.headers.get("Content-Type", "image/jpeg"))
+    except requests.RequestException as e:
+        abort(502, f"CDN fetch failed: {e}")
+
+
+# ─── Translation helpers (one per provider) ──────────────────────────────────
+
+def _inject_lang_hint(payload: dict, source_lang: str) -> None:
+    """Append a language-specific hint to the system message in-place."""
+    lang_hint = _LANG_HINTS.get(source_lang, "")
+    if not lang_hint:
+        return
+    for msg in payload.get("messages", []):
+        if isinstance(msg, dict) and msg.get("role") == "system":
+            msg["content"] = msg["content"] + f"\n\nLANGUAGE NOTE: {lang_hint}"
+            break
+
+
+def _translate_deepseek(api_key: str, payload: dict):
+    """
+    Forward an OpenAI-style payload to DeepSeek and return a normalised response.
+
+    DeepSeek V4 models support dual Thinking / Non-Thinking modes.  In thinking
+    mode the final answer lands in `choices[0].message.content` as usual, but the
+    chain-of-thought appears in `reasoning_content`.  Occasionally (especially
+    under heavy load or with certain prompt shapes) `content` comes back as null
+    or an empty string while `reasoning_content` contains the actual JSON output.
+    Without the normalisation below that silently becomes all-"—" translations.
+    """
+    import json as _json
+    try:
+        r = requests.post(
+            DEEPSEEK_API,
+            json=payload,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {api_key}",
+                "User-Agent":    USER_AGENT,
+            },
+            timeout=60,
+        )
+    except requests.RequestException as e:
+        abort(502, f"DeepSeek API error: {e}")
+
+    if not r.ok:
+        return Response(r.content, status=r.status_code,
+                        content_type=r.headers.get("Content-Type", "application/json"))
+
+    # ── Normalise to guaranteed-non-empty content ─────────────────────────────
+    try:
+        import re as _re
+        data    = r.json()
+        choices = data.get("choices") or []
+        msg     = choices[0].get("message", {}) if choices else {}
+        content = msg.get("content") or ""
+        # Thinking-mode rescue: reasoning_content holds the chain-of-thought, NOT the
+        # final answer.  Blindly using it as content causes the frontend to receive
+        # thousands of characters of reasoning text that can't be parsed as JSON.
+        # Correct behaviour: if content is empty, try to rescue a translations JSON block
+        # that the model may have embedded at the very end of its reasoning chain.
+        # If no valid JSON is found there either, abort with a helpful error.
+        if not content.strip():
+            rc = (msg.get("reasoning_content") or "").strip()
+            if rc:
+                # A thinking model sometimes writes its final answer inside the
+                # reasoning chain when it runs out of output budget — rescue it here.
+                #
+                # Strategy A (primary): rfind the last "translations" key, walk back
+                # to the opening brace, then parse with json.loads.  This correctly
+                # handles nested objects like {"model":{"name":"x"},"translations":[...]}
+                # that the regex below would choke on due to its [^{}]*? guard.
+                idx = rc.rfind('"translations"')
+                if idx >= 0:
+                    brace = rc.rfind('{', 0, idx)
+                    if brace >= 0:
+                        try:
+                            m_obj = _json.loads(rc[brace:])
+                            if isinstance(m_obj, dict) and "translations" in m_obj:
+                                content = rc[brace:]
+                        except Exception:
+                            pass
+                # Strategy B (fallback): regex — catches malformed JSON that
+                # json.loads rejects but still contains a parseable translations array.
+                # Only runs when Strategy A found nothing.
+                if not content.strip():
+                    m = _re.search(
+                        r'\{[^{}]*?"translations"\s*:\s*\[[\s\S]*?\]\s*\}',
+                        rc
+                    )
+                    if m:
+                        content = m.group(0)
+            if not content.strip():
+                finish = choices[0].get("finish_reason", "") if choices else ""
+                abort(422,
+                      f"DeepSeek thinking model returned no final JSON output "
+                      f"(finish_reason={finish!r}). The model likely exhausted its token "
+                      "budget on reasoning before producing an answer. "
+                      "Try: (1) raising max_tokens (current: 4000 → try 8000), "
+                      "(2) switching to DeepSeek V4 Flash (non-thinking, faster), or "
+                      "(3) using Gemini 2.5 Flash which has built-in thinking suppression.")
+        if not content.strip():
+            finish = choices[0].get("finish_reason", "") if choices else ""
+            abort(422,
+                  f"DeepSeek returned no content (finish_reason={finish!r}). "
+                  "Retry the page.")
+        return Response(
+            _json.dumps({"choices": [{"message": {"content": content}}]}),
+            status=200,
+            content_type="application/json",
+        )
+    except HTTPException:
+        # Our own abort(422, ...) calls above are deliberate control flow — let
+        # them propagate unchanged so Flask turns them into the intended
+        # client-facing error response.
+        raise
+    except Exception as _exc:
+        # Genuinely unexpected shape (e.g. r.json() failed to decode, or
+        # choices[0] wasn't a dict). By this point r.ok was already True, so
+        # silently returning r.content here would ship the client an HTTP 200
+        # whose body doesn't match the {"choices":[...]} contract it expects —
+        # a bug in *our* normalisation code disguised as a successful response.
+        # Log it and fail loudly with a real error status instead.
+        print(f"  [TL] DeepSeek response normalisation failed unexpectedly: {_exc!r}")
+        abort(502, f"DeepSeek response parsing failed unexpectedly: {_exc}")
+
+
+def _translate_gemini(api_key: str, payload: dict):
+    """
+    Convert an OpenAI-style payload to Gemini's generateContent format,
+    call the Gemini API, then normalize the response back to OpenAI format
+    so the frontend needs no changes.
+    """
+    import json as _json
+
+    model       = payload.get("model", "gemini-2.5-flash")
+    messages    = payload.get("messages", [])
+    temperature = payload.get("temperature", 0.3)
+    max_tokens  = payload.get("max_tokens", 3000)
+
+    # Split system instruction from conversation turns
+    system_text = ""
+    user_text   = ""
+    for msg in messages:
+        role = msg.get("role", "")
+        text = msg.get("content", "")
+        if role == "system":
+            system_text = text
+        elif role == "user":
+            user_text = text
+
+    gemini_payload: dict = {
+        "contents": [{"role": "user", "parts": [{"text": user_text}]}],
+        "generationConfig": {
+            "temperature":     temperature,
+            "maxOutputTokens": max_tokens,
+            # Disable thinking mode (Gemini 2.5+).
+            # Without this, thinking-capable models return a multi-part response:
+            #   parts[0] = {"thought": true, "text": "...8000-char analysis..."}
+            #   parts[1] = {"text": "{\"translations\":[...]}"}   ← what we actually need
+            # The old parts[0]-only extraction grabbed the analysis instead of the JSON,
+            # causing all-"—" translations on every page with enough text to trigger thinking.
+            # Setting thinkingBudget=0 requests a direct JSON response on all pages.
+            # Models that don't support thinkingConfig silently ignore this field.
+            "thinkingConfig": {"thinkingBudget": 0},
+            # API-level JSON enforcement (Gemini 1.5+).
+            # Even when thinkingBudget=0 is ignored by a model, responseMimeType forces
+            # the output to be valid JSON — the model cannot return prose or markdown.
+            # This is the definitive fix for "All 3 JSON parse strategies failed" errors
+            # caused by the model dumping its reasoning chain as plain text.
+            "responseMimeType": "application/json",
+        },
+    }
+    if system_text:
+        gemini_payload["system_instruction"] = {
+            "parts": [{"text": system_text}]
+        }
+
+    url = GEMINI_API.format(model=model) + f"?key={api_key}"
+
+    try:
+        r = requests.post(
+            url,
+            json=gemini_payload,
+            headers={"Content-Type": "application/json", "User-Agent": USER_AGENT},
+            timeout=60,
+        )
+    except requests.RequestException as e:
+        abort(502, f"Gemini API error: {e}")
+
+    if not r.ok:
+        # Surface the Gemini error directly so the frontend can show it
+        return Response(r.content, status=r.status_code,
+                        content_type=r.headers.get("Content-Type", "application/json"))
+
+    # Normalize to OpenAI-compatible format (choices[0].message.content)
+    try:
+        gemini_resp = r.json()
+        candidates  = gemini_resp.get("candidates") or []
+        cand        = candidates[0] if candidates else {}
+        # ── Extract text, skipping thought parts ─────────────────────────────
+        # Safety net for when thinking is still active despite thinkingBudget=0
+        # (e.g. a model that ignores the hint, or thinkingBudget not yet supported).
+        # Gemini thinking responses look like:
+        #   parts = [{"thought": True, "text": "..."}, {"text": "...JSON..."}]
+        # We skip any part flagged as thought and take the first real output part.
+        parts = cand.get("content", {}).get("parts", [])
+        text  = ""
+        for part in parts:
+            if not part.get("thought", False):
+                candidate = part.get("text", "")
+                if candidate.strip():
+                    text = candidate
+                    break
+        # Absolute fallback — should never be reached with thinkingBudget=0
+        if not text and parts:
+            text = parts[0].get("text", "")
+    except Exception:
+        abort(502, "Gemini response parse error.")
+
+    # ── Guard: empty text means Gemini produced no output ────────────────────
+    # This happens when the safety filter blocks the request (finishReason=SAFETY),
+    # the response was truncated (MAX_TOKENS with no partial text), or the model
+    # returned a pure-thinking response with no output parts.
+    # Without this check the proxy returns HTTP 200 with content="", which the
+    # frontend silently treats as a failed parse and falls back to all-"—"
+    # translations — indistinguishable from a successful empty-chapter result.
+    if not text.strip():
+        finish      = cand.get("finishReason", "")
+        prompt_fb   = gemini_resp.get("promptFeedback", {})
+        block       = prompt_fb.get("blockReason", "")
+        if block:
+            abort(422, f"Gemini blocked the request ({block}). Try a different model or retry.")
+        elif finish and finish != "STOP":
+            abort(422, f"Gemini returned no text (finishReason={finish!r}). Retry the page.")
+        else:
+            abort(422, "Gemini returned an empty response. Check your API key / model and retry.")
+
+    normalized = {"choices": [{"message": {"content": text}}]}
+    return Response(
+        _json.dumps(normalized),
+        status=200,
+        content_type="application/json",
+    )
+
+
+# ─── /translate  (multi-provider) ────────────────────────────────────────────
+@app.route("/translate", methods=["POST"])
+def translate():
+    """
+    POST body:
+        {
+          "provider":    "gemini" | "deepseek",   # default: deepseek
+          "key":         "<api key>",
+          "payload":     { ...OpenAI-style chat-completions body... },
+          "source_lang": "vi"                      # optional, for lang hints
+        }
+
+    All providers return an OpenAI-compatible JSON body so the frontend
+    only needs to read choices[0].message.content regardless of provider.
+    The API key is forwarded server-side and never appears in DevTools.
+    """
+    body        = request.get_json(force=True, silent=True) or {}
+    provider    = body.get("provider", "deepseek").strip().lower()
+    api_key     = body.get("key", "").strip()
+    payload     = body.get("payload")
+    source_lang = body.get("source_lang", "").strip().lower()
+
+    if not api_key:
+        abort(400, "API key required.")
+    if not isinstance(payload, dict):
+        abort(400, "payload must be a JSON object.")
+
+    # Inject cultural/linguistic hints into the system message
+    _inject_lang_hint(payload, source_lang)
+
+    if provider == "gemini":
+        return _translate_gemini(api_key, payload)
+    else:
+        # Default / "deepseek"
+        return _translate_deepseek(api_key, payload)
+
+
+@app.route("/ocr", methods=["POST"])
+def ocr_page():
+    """
+    POST body:  { "url": "https://cdn…/page.jpg", "lang": "vi",
+                  "ai_key": "AIza…",          # optional — enables Gemini Vision OCR
+                  "ai_model": "gemini-2.5-flash",
+                  "vision_mode": "smart" }    # 'smart' | 'all' | 'off'  (default: 'smart')
+    Response:   { "regions": [{ "text": "…", "cx": 45.2, "cy": 23.1 }, …] }
+
+    vision_mode controls when Gemini Vision OCR fires (only when ai_key is present):
+      'smart' — only for languages in VISION_LANGS (complex/vertical scripts).
+                Best for free-tier users: saves quota for scripts EasyOCR handles well.
+      'all'   — Vision OCR for every language. Max quality but doubles API calls.
+      'off'   — Always EasyOCR regardless. Zero extra quota used.
+    DeepSeek users never send an ai_key so they always use EasyOCR.
+    If Gemini Vision errors or returns empty, falls back to EasyOCR automatically.
+    """
+    body         = request.get_json(force=True, silent=True) or {}
+    image_url    = body.get("url", "").strip()
+    lang         = body.get("lang", "en").lower()
+    margin_scale = max(0.1, min(2.0, float(body.get("margin_scale", 0.5))))
+    ai_key       = body.get("ai_key",       "").strip()
+    ai_model     = body.get("ai_model",     "gemini-2.5-flash").strip()
+    vision_mode  = body.get("vision_mode",  "smart").strip().lower()  # 'smart' | 'all' | 'off'
+
+    _validate_image_url(image_url)
+
+    # 1. Download
+    try:
+        img_r = requests.get(image_url, timeout=20,
+                              headers={"User-Agent": USER_AGENT})
+        img_r.raise_for_status()
+    except requests.RequestException as e:
+        abort(502, f"Image download failed: {e}")
+
+    image_bytes = img_r.content
+
+    # ── Gemini Vision routing ─────────────────────────────────────────────────
+    # Decide whether to use Vision OCR based on vision_mode:
+    #   'all'   → always use Vision (when key present)
+    #   'smart' → only for VISION_LANGS (complex/vertical scripts)
+    #   'off'   → skip Vision, go straight to EasyOCR
+    # Free-tier users should stick with 'smart' — each Vision call costs quota
+    # on top of the translation call, so 'all' roughly halves their daily limit.
+    use_vision = bool(ai_key) and vision_mode != "off" and (
+        vision_mode == "all" or lang in VISION_LANGS
+    )
+    fallback_reason = None   # set if Vision was attempted but fell back
+
+    if use_vision:
+        print(f"  [OCR] Using Gemini Vision for lang={lang} (mode={vision_mode})")
+        regions, fallback_reason = _ocr_gemini_vision(image_bytes, lang, ai_key, ai_model)
+        if regions:
+            # Vision found text — but Flash-Lite's cx/cy/box can still be
+            # unreliable even after _ocr_gemini_vision's own normalisation
+            # and extreme-cluster fallback. EasyOCR is a real text-DETECTION
+            # model, so its boxes don't suffer from that kind of LLM spatial
+            # hallucination. Run it here too — purely for POSITIONS — and
+            # adopt its box for any Vision item whose text fuzzy-matches an
+            # EasyOCR detection. Vision's text/type stay as-is either way;
+            # only cx/cy/box may change. Items with no good EasyOCR match
+            # keep whatever _ocr_gemini_vision already worked out for them.
+            easy_regions, raw_boxes_out = _run_easyocr_detection(image_bytes, lang, margin_scale)
+            matched, total = _match_vision_to_easyocr(regions, easy_regions, raw_boxes_out)
+            print(f"  [OCR] Vision+EasyOCR position match: {matched}/{total} item(s) "
+                  f"used EasyOCR boxes; {total - matched} kept Vision's own coords")
+            engine = "vision+easyocr" if matched else "vision"
+            return jsonify({"regions": regions, "raw_boxes": raw_boxes_out,
+                            "ocr_engine": engine})
+        # Vision returned nothing — fall through to EasyOCR
+        # fallback_reason tells the frontend why: "quota" | "error" | "network" | "parse" | "empty"
+        print(f"  [OCR] Vision fell back ({fallback_reason}) — using EasyOCR")
+
+    # ── EasyOCR path ──────────────────────────────────────────────────────────
+    regions, raw_boxes_out = _run_easyocr_detection(image_bytes, lang, margin_scale)
+
+    return jsonify({
+        "regions":   regions,
+        "raw_boxes": raw_boxes_out,
+        "ocr_engine": "easyocr",
+        # Included when Vision was attempted but fell back (quota / error / network / parse).
+        # None / absent when Vision was never tried (mode='off', no key, or lang not in VISION_LANGS).
+        **({"vision_fallback": fallback_reason} if fallback_reason else {}),
+    })
+
+
+@app.route("/ocr-crop", methods=["POST"])
+def ocr_crop():
+    """
+    POST body:  { "url": "https://cdn…/page.jpg",
+                  "box": [x1, y1, x2, y2],   # pixel coords
+                  "lang": "vi" }
+    Response:   { "text": "recognized text" }
+
+    Crops the image to the given pixel box and runs OCR on just that region.
+    Called by the correction UI when the user draws a new bounding box.
+    """
+    body      = request.get_json(force=True, silent=True) or {}
+    image_url = body.get("url", "").strip()
+    box       = body.get("box", [])
+    lang      = body.get("lang", "en").lower()
+
+    _validate_image_url(image_url)
+    if len(box) != 4:
+        abort(400, "box must be [x1, y1, x2, y2] in pixels.")
+
+    # Download
+    try:
+        img_r = requests.get(image_url, timeout=20,
+                             headers={"User-Agent": USER_AGENT})
+        img_r.raise_for_status()
+    except requests.RequestException as e:
+        abort(502, f"Image download failed: {e}")
+
+    # Decode + crop
+    try:
+        pil      = Image.open(io.BytesIO(img_r.content)).convert("RGB")
+        iw, ih   = pil.size
+        x1, y1, x2, y2 = (max(0, min(int(v), d - 1))
+                           for v, d in zip(box, [iw, ih, iw, ih]))
+        if x2 <= x1 or y2 <= y1:
+            abort(400, "Crop box has zero area after clamping.")
+        crop = pil.crop((x1, y1, x2, y2))
+        arr  = _preprocess_for_ocr(np.array(crop))
+    except Exception as e:
+        abort(422, f"Image decode/crop error: {e}")
+
+    # OCR the crop (serialised)
+    try:
+        reader = _get_reader(lang)
+        with _infer_lock:
+            raw = reader.readtext(arr, detail=1, paragraph=False,
+                                  contrast_ths=0.1, adjust_contrast=0.5,
+                                  text_threshold=0.6, min_size=10)
+    except Exception as e:
+        abort(500, f"OCR failed: {e}")
+
+    min_conf = _MIN_CONF_MAP.get(lang, 0.35)
+    # Same short-word carve-out as _run_easyocr_detection (see comment there) —
+    # standalone 1-2 character words can legitimately score well below the
+    # normal per-language floor.
+    texts = [t.strip() for _, t, c in raw
+             if t.strip() and c >= (0.12 if len(t.strip()) <= 2 else min_conf)]
+    return jsonify({"text": " ".join(texts)})
+
+
+@app.route("/vision-crop", methods=["POST"])
+def vision_crop():
+    """
+    POST body:  { "url": "https://cdn…/page.jpg",
+                  "box": [x1, y1, x2, y2],   # pixel coords
+                  "lang": "vi",
+                  "ai_key": "AIza…",
+                  "ai_model": "gemini-2.0-flash-lite" }
+    Response:   { "text": "recognized text" }
+
+    Crops the image to the given pixel box and sends it to Gemini Vision
+    for OCR. Called by the correction UI's ✦ VISION draw mode.
+
+    Compared to /ocr-crop (EasyOCR), this handles:
+      - Stylised / decorative manga fonts that stump EasyOCR
+      - Vertical text / mixed-script SFX
+      - Regions where EasyOCR confidence was too low and the badge was wrong
+    """
+    body      = request.get_json(force=True, silent=True) or {}
+    image_url = body.get("url", "").strip()
+    box       = body.get("box", [])
+    lang      = body.get("lang", "en").lower()
+    ai_key    = body.get("ai_key", "").strip()
+    ai_model  = body.get("ai_model", "gemini-2.5-flash").strip()
+
+    _validate_image_url(image_url)
+    if len(box) != 4:
+        abort(400, "box must be [x1, y1, x2, y2] in pixels.")
+    if not ai_key:
+        abort(400, "ai_key is required for Vision crop.")
+
+    # Download
+    try:
+        img_r = requests.get(image_url, timeout=20,
+                             headers={"User-Agent": USER_AGENT})
+        img_r.raise_for_status()
+    except requests.RequestException as e:
+        abort(502, f"Image download failed: {e}")
+
+    # Decode + crop
+    try:
+        pil      = Image.open(io.BytesIO(img_r.content)).convert("RGB")
+        iw, ih   = pil.size
+        x1, y1, x2, y2 = (max(0, min(int(v), d - 1))
+                           for v, d in zip(box, [iw, ih, iw, ih]))
+        if x2 <= x1 or y2 <= y1:
+            abort(400, "Crop box has zero area after clamping.")
+        crop = pil.crop((x1, y1, x2, y2))
+    except Exception as e:
+        abort(422, f"Image decode/crop error: {e}")
+
+    # Encode crop as base64 PNG for Gemini
+    buf = io.BytesIO()
+    crop.save(buf, format="PNG")
+    b64 = base64.b64encode(buf.getvalue()).decode()
+
+    lang_name = _VISION_LANG_NAMES.get(lang, lang)
+
+    prompt = (
+        f"This is a cropped region from a manga page. "
+        f"The source language is {lang_name}.\n"
+        f"Read ALL visible text in this image exactly as printed, in natural reading order "
+        f"(right-to-left for Japanese/Korean, left-to-right otherwise). "
+        f"Include sound effects (SFX/onomatopoeia) if present.\n"
+        f"Return ONLY the raw text with no explanation, no labels, no punctuation added "
+        f"by you, and no markdown. If there is no text, return an empty string."
+    )
+
+    url = GEMINI_API.format(model=ai_model)
+    payload = {
+        "contents": [{
+            "parts": [
+                {"inline_data": {"mime_type": "image/png", "data": b64}},
+                {"text": prompt},
+            ]
+        }],
+        "generationConfig": {
+            "temperature": 0.0,
+            "maxOutputTokens": 512,
+        },
+    }
+
+    # Flash-Lite sometimes supports thinking; explicitly disable it for crop
+    # requests — we want speed and a plain string, not a deliberation block.
+    if "lite" in ai_model.lower() or "flash" in ai_model.lower():
+        payload["generationConfig"]["thinkingConfig"] = {"thinkingBudget": 0}
+
+    try:
+        r = requests.post(
+            f"{url}?key={ai_key}",
+            json=payload,
+            timeout=20,
+            headers={"Content-Type": "application/json"},
+        )
+    except requests.RequestException as e:
+        abort(502, f"Gemini network error: {e}")
+
+    if r.status_code == 429:
+        abort(429, "Gemini quota exceeded — try again shortly or use EasyOCR Draw instead.")
+    if not r.ok:
+        abort(502, f"Gemini Vision error {r.status_code}: {r.text[:200]}")
+
+    try:
+        resp    = r.json()
+        # Strip any thinking blocks: only keep plain text parts
+        parts   = resp["candidates"][0]["content"]["parts"]
+        text    = " ".join(
+            p["text"].strip() for p in parts
+            if p.get("text") and not p.get("thought")
+        ).strip()
+    except (KeyError, IndexError, ValueError):
+        abort(502, "Unexpected Gemini Vision response format.")
+
+    return jsonify({"text": text})
+
+
+# ─── Startup helpers ──────────────────────────────────────────────────────────
+
+# FIX #10 — check for port conflict before Flask tries to bind
+def _port_in_use(port: int) -> bool:
+    """Return True if something is already listening on HOST:port."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        return s.connect_ex((HOST, port)) == 0
+
+
+# FIX #11 — poll the socket instead of using a fixed 1-second sleep,
+#            so the browser opens as soon as Flask is actually ready
+def _open_when_ready():
+    """Poll until the server accepts connections, then open the browser."""
+    for _ in range(30):          # up to 3 seconds total
+        try:
+            with socket.create_connection((HOST, PORT), timeout=0.1):
+                webbrowser.open(f"http://{HOST}:{PORT}")
+                return
+        except OSError:
+            time.sleep(0.1)
+
+
+# ─── Entry ────────────────────────────────────────────────────────────────────
+# FIX #14 — safety check: this app stores Gemini/DeepSeek API keys and
+#   MangaDex client_secret in the browser's localStorage in plaintext, and
+#   /proxy, /ocr, /ocr-crop, /vision-crop are unauthenticated HTTP endpoints.
+#   That's an acceptable risk model for HOST=127.0.0.1 (only the local user
+#   can reach it), but becomes a real credential/data exposure if HOST is
+#   ever changed to 0.0.0.0 or a LAN/public address without adding auth in
+#   front of it. Warn loudly rather than silently doing the unsafe thing.
+_LOCALHOST_ADDRS = {"127.0.0.1", "localhost", "::1"}
+
+def _warn_if_exposed(host: str) -> None:
+    if host in _LOCALHOST_ADDRS:
+        return
+    print()
+    print("  ⚠️   WARNING: HOST is not localhost (currently: " + host + ")")
+    print("  ⚠️   This server has no authentication. Anyone who can reach it")
+    print("  ⚠️   on your network can read stored API keys, log in as you on")
+    print("  ⚠️   MangaDex (client_secret is sent to /auth/login unauthenticated),")
+    print("  ⚠️   and use /proxy, /ocr, /ocr-crop, /vision-crop.")
+    print("  ⚠️   Only do this on a trusted network, and ideally put it behind")
+    print("  ⚠️   your own auth (reverse proxy, VPN, etc.) first.")
+    print()
+
+
+if __name__ == "__main__":
+    # FIX #10 — friendly error instead of a cryptic socket traceback
+    if _port_in_use(PORT):
+        print(f"\n  ✗  Port {PORT} is already in use.")
+        print(f"     Stop the other process, or change PORT at the top of this script.\n")
+        sys.exit(1)
+
+    _warn_if_exposed(HOST)
+
+    addr = f"http://{HOST}:{PORT}"
+    print(f"\n  MangaTL  →  {addr}")
+    print(  "  Ctrl+C to stop\n")
+    threading.Thread(target=_open_when_ready, daemon=True).start()
+    app.run(host=HOST, port=PORT, debug=False, threaded=True)
